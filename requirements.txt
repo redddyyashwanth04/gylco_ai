@@ -1,0 +1,25 @@
+# Data handling
+pandas
+numpy
+
+# Modeling
+scikit-learn
+xgboost
+lightgbm
+catboost
+imbalanced-learn
+
+# Deep learning (Track B: LSTM/GRU sequence model)
+torch
+
+# Explainability
+shap
+
+# LLM interpretability layer (free tier via Groq -- no credit card required)
+groq
+
+# Demo app
+streamlit
+
+# Testing
+pytest

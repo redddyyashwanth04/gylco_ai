@@ -1,0 +1,35 @@
+# Environments
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Data (raw/processed files shouldn't live in version control -- too large,
+# and some are subject to PhysioNet's data use agreement, which prohibits
+# redistribution)
+data/raw/nhanes/*.XPT
+data/raw/mimic_demo/*.csv.gz
+data/external/*.csv
+data/model_ready/*
+data/augmented/*
+!data/*/.gitkeep
+
+# Local app state -- per-machine, never shared
+data/app_state.db
+
+# Trained model artifacts (large binary files -- track via a model registry
+# entry + external storage if needed, not git)
+models_saved/*
+!models_saved/.gitkeep
+
+# Secrets
+.env
+*.pem
+
+# OS/editor cruft
+.DS_Store
+.vscode/
+.idea/
+
+# Notebook checkpoints
+.ipynb_checkpoints/
