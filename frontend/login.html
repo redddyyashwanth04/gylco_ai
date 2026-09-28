@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#173b36">
+  <title>Sign in | Carepath</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+  <script src="login.js" defer></script>
+</head>
+<body class="auth-page">
+  <main class="auth-layout">
+    <section class="auth-side" aria-label="Carepath workspace information">
+      <a class="brand auth-brand" href="/" aria-label="Carepath">
+        <span class="brand-mark" aria-hidden="true">+</span>
+        <span><strong>carepath</strong><small>CLINICIAN WORKSPACE</small></span>
+      </a>
+      <div class="auth-side-copy">
+        <p class="eyebrow">TYPE 2 DIABETES CARE</p>
+        <h1>One shared view of every patient.</h1>
+        <p>Review current measurements, longitudinal visits, and model estimates in one clinician workspace.</p>
+      </div>
+      <div class="shared-access-note">
+        <span class="shared-icon" aria-hidden="true">↗</span>
+        <p><strong>Shared clinic demo</strong><span>Every demo clinician sees the same patient records.</span></p>
+      </div>
+      <p class="auth-side-footer">Research prototype · Not a clinical system</p>
+    </section>
+
+    <section class="auth-main">
+      <div class="auth-form-wrap">
+        <div class="auth-heading">
+          <p class="eyebrow">DEMO ACCESS</p>
+          <h2>Clinician sign in</h2>
+          <p>Use a demo account to enter the shared workspace.</p>
+        </div>
+        <div class="demo-credentials">
+          <span>DEMO ACCOUNTS</span>
+          <strong>dr.smith · dr.lee · dr.patel</strong>
+          <small>Password: <b>clinic123</b></small>
+          <button class="text-button" type="button" id="fill-demo-button">Fill dr.smith details</button>
+        </div>
+        <form id="auth-form" novalidate>
+          <label class="field" for="username"><span>Username</span><input id="username" name="username" type="text" minlength="3" maxlength="32" autocomplete="username" placeholder="dr.smith" required></label>
+          <label class="field" for="password"><span>Password</span><input id="password" name="password" type="password" minlength="8" maxlength="32" autocomplete="current-password" placeholder="Enter the demo password" required></label>
+          <p class="auth-error" id="auth-error" role="alert" aria-live="polite"></p>
+          <button class="primary-button auth-submit" id="auth-submit" type="submit">Enter demo workspace <span aria-hidden="true">→</span></button>
+        </form>
+        <p class="auth-security-note"><span aria-hidden="true">◈</span> Demo-only front-end gate. It does not provide real account security.</p>
+        <p class="auth-footnote">This prototype runs locally and is not approved for protected health information or production use.</p>
+      </div>
+    </section>
+  </main>
+</body>
+</html>
