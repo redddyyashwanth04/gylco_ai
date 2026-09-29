@@ -1,15 +1,14 @@
 """Local HTTP adapter for the standalone clinician frontend.
 
 Run from the project root with:
-    .venv/Scripts/python.exe -m src.api_server
+    python -m src.api_server
 
-This prototype binds to loopback only and is not suitable for network or
-production use. It exposes the existing model and database functions without
-changing their behavior.
+Binds to loopback only; not suitable for network or production use.
 """
 
 import json
 import pickle
+import re
 import sys
 from math import isfinite
 from http import HTTPStatus
@@ -20,7 +19,7 @@ from urllib.parse import unquote, urlparse
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from config import MODELS_SAVED
+from config import MODELS_SAVED, MIMIC_TRAJECTORIES
 from src.models.predict import (
     TARGETS,
     compute_risk_delta,
@@ -30,10 +29,12 @@ from src.models.predict import (
 )
 from src.storage.db import (
     add_visit,
+    count_predictions,
     get_active_model_version,
     get_connection,
     get_patient_history,
     init_db,
+    list_patient_summaries,
     log_prediction,
 )
 
@@ -44,6 +45,7 @@ ALLOWED_ORIGINS = {
     "http://localhost:5173",
 }
 MAX_BODY_BYTES = 64 * 1024
+MAX_CASES = 12
 VALUE_RANGES = {
     "RIDAGEYR": (18, 100),
     "LBXGH": (3, 15),
@@ -57,13 +59,14 @@ VALUE_RANGES = {
 
 
 def validate_values(values, required_fields=()):
+    """Validates numeric clinical input. Empty optional fields (None) are dropped."""
     if not isinstance(values, dict):
         raise ValueError("Patient values are required.")
     for field in required_fields:
         if values.get(field) is None:
             raise ValueError(f"{field} is required for the model input.")
     normalized = dict(values)
-    for field, value in normalized.items():
+    for field, value in list(normalized.items()):
         if value is None:
             continue
         if isinstance(value, bool):
@@ -79,11 +82,20 @@ def validate_values(values, required_fields=()):
             if not minimum <= number <= maximum:
                 raise ValueError(f"{field} must be between {minimum} and {maximum}.")
         normalized[field] = number
-    return normalized
+    return {k: v for k, v in normalized.items() if v is not None}
+
+
+def forecaster_expected_error():
+    """Leave-one-patient-out mean absolute error, parsed from the registry notes."""
+    active = get_active_model_version("mimic_glucose_forecaster")
+    if not active:
+        return None
+    match = re.search(r"mean abs error ([\d.]+)", active.get("notes") or "")
+    return float(match.group(1)) if match else None
 
 
 class ApiHandler(BaseHTTPRequestHandler):
-    server_version = "CarepathLocalAPI/1.0"
+    server_version = "CarepathLocalAPI/1.1"
 
     def send_json(self, status, payload):
         body = json.dumps(payload, allow_nan=False).encode("utf-8")
@@ -141,11 +153,17 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.get_visits()
             elif path == "/api/models":
                 self.get_models()
+            elif path == "/api/patients":
+                self.get_patients()
+            elif path == "/api/cases":
+                self.get_cases()
             elif path.startswith("/api/patients/") and path.endswith("/visits"):
                 patient_id = unquote(path[len("/api/patients/"):-len("/visits")].strip("/"))
                 self.get_patient_visits(patient_id)
             else:
                 self.send_json(HTTPStatus.NOT_FOUND, {"error": "Endpoint not found."})
+        except (ValueError, TypeError) as error:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
         except Exception:
             self.log_error("GET request failed for %s", path)
             self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "The local service could not complete this request."})
@@ -158,6 +176,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             payload = self.read_json()
             if path == "/api/predict":
                 self.post_prediction(payload)
+            elif path == "/api/explain":
+                self.post_explain(payload)
             elif path == "/api/visits":
                 self.post_visit(payload)
             elif path == "/api/forecast":
@@ -169,6 +189,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         except Exception:
             self.log_error("POST request failed for %s", path)
             self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "The local service could not complete this request."})
+
+    # ---------- GET handlers ----------
 
     def get_health(self):
         try:
@@ -188,68 +210,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                 "error": "The saved NHANES model could not be loaded.",
             })
 
-    def post_prediction(self, payload):
-        values = validate_values(payload.get("values"), ("RIDAGEYR", "LBXGH", "LBXGLU"))
-
-        risks, model_name, _ = predict_patient(values)
-        recommendations = generate_clinical_recommendations(values, risks)
-        trends = None
-        patient_id = str(payload.get("patientId", "")).strip()
-        if patient_id:
-            history = get_patient_history(patient_id)
-            if history:
-                previous = history[-1]
-                previous_values = {
-                    "RIDAGEYR": values.get("RIDAGEYR"),
-                    "LBXGH": previous["hba1c"],
-                    "LBXGLU": previous["glucose"],
-                    "BMXBMI": previous["bmi"],
-                    "BPXOSY1": previous["systolic_bp"],
-                    "BPXODI1": previous["diastolic_bp"],
-                }
-                previous_risks, _, _ = predict_patient(previous_values)
-                trends = {}
-                for target in TARGETS:
-                    delta, direction = compute_risk_delta(
-                        {target: risks[target]}, previous_risks
-                    )
-                    trends[target] = {"delta": delta, "direction": direction}
-
-        active = get_active_model_version("nhanes_active")
-        if active:
-            log_prediction("nhanes_active", active["version_id"], risks, patient_id or None)
-
-        self.send_json(HTTPStatus.OK, {
-            "risks": risks,
-            "modelName": model_name,
-            "recommendations": recommendations,
-            "trends": trends,
-        })
-
-    def post_visit(self, payload):
-        patient_id = str(payload.get("patientId", "")).strip()
-        if not patient_id:
-            raise ValueError("A patient ID is required to save a visit to the patient record.")
-        if len(patient_id) > 40:
-            raise ValueError("Patient ID cannot exceed 40 characters.")
-        values = validate_values(payload.get("values"))
-
-        add_visit(
-            patient_id,
-            hba1c=values.get("LBXGH"),
-            glucose=values.get("LBXGLU"),
-            bmi=values.get("BMXBMI"),
-            systolic_bp=values.get("BPXOSY1"),
-            diastolic_bp=values.get("BPXODI1"),
-        )
-        self.send_json(HTTPStatus.CREATED, {"saved": True, "patientId": patient_id})
-
     def get_visits(self):
         connection = get_connection()
         try:
             rows = connection.execute(
                 """SELECT patient_id, visit_date, hba1c, glucose, bmi,
-                          systolic_bp, diastolic_bp
+                          systolic_bp, diastolic_bp, risks_json
                    FROM visits ORDER BY visit_date DESC, visit_id DESC"""
             ).fetchall()
             self.send_json(HTTPStatus.OK, {"visits": [dict(row) for row in rows]})
@@ -265,6 +231,12 @@ class ApiHandler(BaseHTTPRequestHandler):
             "visits": [dict(row) for row in rows],
         })
 
+    def get_patients(self):
+        self.send_json(HTTPStatus.OK, {
+            "patients": [dict(r) for r in list_patient_summaries()],
+            "predictionCount": count_predictions(),
+        })
+
     def get_models(self):
         connection = get_connection()
         try:
@@ -276,6 +248,93 @@ class ApiHandler(BaseHTTPRequestHandler):
             self.send_json(HTTPStatus.OK, {"models": [dict(row) for row in rows]})
         finally:
             connection.close()
+
+    def get_cases(self):
+        """Pre-loaded MIMIC-IV demo glucose trajectories (Mode 2 examples). Subject IDs are not exposed."""
+        import pandas as pd
+
+        if not MIMIC_TRAJECTORIES.exists():
+            self.send_json(HTTPStatus.OK, {"cases": []})
+            return
+        traj = pd.read_csv(MIMIC_TRAJECTORIES, parse_dates=["charttime"])
+        glucose = traj[traj["lab_name"] == "glucose"].dropna(subset=["valuenum"])
+        groups = [g.sort_values("charttime") for _, g in glucose.groupby("subject_id") if len(g) >= 5]
+        groups.sort(key=len, reverse=True)
+        cases = []
+        for grp in groups[:MAX_CASES]:
+            n = len(cases) + 1
+            cases.append({
+                "id": f"mimic-{n}",
+                "label": f"MIMIC-IV demo case {n}",
+                "totalReadings": int(len(grp)),
+                "readings": [float(v) for v in grp["valuenum"].tail(40)],
+            })
+        self.send_json(HTTPStatus.OK, {"cases": cases})
+
+    # ---------- POST handlers ----------
+
+    def post_prediction(self, payload):
+        values = validate_values(payload.get("values"), ("RIDAGEYR", "LBXGH", "LBXGLU"))
+
+        risks, model_name, _ = predict_patient(values)
+        recommendations = generate_clinical_recommendations(values, risks)
+
+        # Trend = change versus the risks stored at the patient's previous visit.
+        trends = None
+        patient_id = str(payload.get("patientId", "")).strip()
+        if patient_id:
+            history = get_patient_history(patient_id)
+            if history and history[-1]["risks_json"]:
+                previous = json.loads(history[-1]["risks_json"])
+                trends = {}
+                for target in TARGETS:
+                    delta, direction = compute_risk_delta({target: risks[target]}, previous)
+                    trends[target] = {"delta": delta, "direction": direction}
+
+        active = get_active_model_version("nhanes_active")
+        if active:
+            log_prediction("nhanes_active", active["version_id"], risks, patient_id or None)
+
+        self.send_json(HTTPStatus.OK, {
+            "risks": risks,
+            "modelName": model_name,
+            "recommendations": recommendations,
+            "trends": trends,
+        })
+
+    def post_explain(self, payload):
+        values = validate_values(payload.get("values"), ("RIDAGEYR", "LBXGH", "LBXGLU"))
+        from src.explainability.explain import explain_patient
+        self.send_json(HTTPStatus.OK, explain_patient(values))
+
+    def post_visit(self, payload):
+        patient_id = str(payload.get("patientId", "")).strip()
+        if not patient_id:
+            raise ValueError("A patient ID is required to save a visit to the patient record.")
+        if len(patient_id) > 40:
+            raise ValueError("Patient ID cannot exceed 40 characters.")
+        values = validate_values(payload.get("values"))
+
+        # Risk snapshot is computed server-side; the client's numbers are not trusted.
+        risks, version_id = None, None
+        try:
+            risks, _, _ = predict_patient(values)
+            active = get_active_model_version("nhanes_active")
+            version_id = active["version_id"] if active else None
+        except Exception:
+            self.log_error("Risk snapshot failed while saving visit")
+
+        add_visit(
+            patient_id,
+            hba1c=values.get("LBXGH"),
+            glucose=values.get("LBXGLU"),
+            bmi=values.get("BMXBMI"),
+            systolic_bp=values.get("BPXOSY1"),
+            diastolic_bp=values.get("BPXODI1"),
+            risks=risks,
+            model_version_id=version_id,
+        )
+        self.send_json(HTTPStatus.CREATED, {"saved": True, "patientId": patient_id})
 
     def post_forecast(self, payload):
         readings = payload.get("readings")
@@ -294,12 +353,13 @@ class ApiHandler(BaseHTTPRequestHandler):
             return
         with open(model_path, "rb") as model_file:
             model = pickle.load(model_file)
-        recent_readings = [float(value) for value in readings[-(WINDOW - 1):]]
-        forecast = float(model.predict([make_features(recent_readings)])[0])
+        recent = [float(value) for value in readings[-(WINDOW - 1):]]
+        forecast = float(model.predict([make_features(recent)])[0])
         self.send_json(HTTPStatus.OK, {
             "forecast": forecast,
-            "lastObserved": recent_readings[-1],
-            "readingsUsed": len(recent_readings),
+            "lastObserved": recent[-1],
+            "readingsUsed": len(recent),
+            "expectedError": forecaster_expected_error(),
         })
 
 

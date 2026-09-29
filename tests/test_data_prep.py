@@ -138,3 +138,12 @@ def test_compute_risk_delta_handles_missing_prior_visit():
     delta, direction = compute_risk_delta({"hypertension": 0.60}, {"hypertension": 0.65})
     assert delta == -0.05
     assert direction == "down"
+def test_validate_values_drops_nulls():
+    from src.api_server import validate_values
+    out = validate_values({"RIDAGEYR": 58, "LBXGH": 7.4, "LBXGLU": 150, "BPXOSY1": None})
+    assert "BPXOSY1" not in out
+
+
+def test_prediabetes_flag_tolerates_none():
+    from src.models.predict import add_engineered_features
+    assert add_engineered_features({"LBXGH": None, "BPXOSY1": None})["PREDIABETES_FLAG"] == 0

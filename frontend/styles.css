@@ -501,3 +501,27 @@ td:first-child { color: #304a41; font-weight: 700; }
   .auth-side-footer { margin-top: auto; }
   .auth-main { padding: 30px 22px; }
 }
+/* ---- Overview, drivers panel, registry table ---- */
+.tile-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 15px; margin-bottom: 18px; }
+.tile { padding: 18px 20px; }
+.tile small { display: block; color: #82918a; font-size: 11px; font-weight: 700; letter-spacing: .8px; }
+.tile strong { display: block; margin: 8px 0 6px; color: #24443d; font: 700 22px/1.2 "Manrope", sans-serif; text-transform: capitalize; }
+.tile span { color: var(--muted); font-size: 12px; }
+@media (max-width: 850px) { .tile-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+
+.chip-row { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0; }
+.chip { padding: 5px 11px; border: 1px solid var(--line); border-radius: 14px; background: #fff; color: var(--ink-soft); cursor: pointer; font-size: 12px; text-transform: capitalize; }
+.chip.active { border-color: var(--green); background: var(--green); color: #fff; }
+
+.bar-row { display: grid; grid-template-columns: 1.3fr 1.2fr 46px; align-items: center; gap: 8px; margin: 9px 0; color: var(--ink-soft); font-size: 12px; }
+.bar-row em { color: var(--muted); font-size: 10px; font-style: normal; }
+.bar-track { display: block; height: 8px; overflow: hidden; border-radius: 4px; background: #eef2f0; }
+.bar-track i { display: block; height: 100%; }
+.bar-track i.up { background: var(--coral); }
+.bar-track i.down { background: var(--green); }
+.bar-val { text-align: right; font-variant-numeric: tabular-nums; }
+
+td .text-button { font-size: inherit; }
+td small { margin-left: 4px; color: var(--muted); }
+.registry-table { margin-top: 15px; }
+.overview-note { color: var(--muted); font-size: 12px; }

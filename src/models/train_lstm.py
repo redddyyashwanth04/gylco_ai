@@ -1,155 +1,234 @@
 """
-LSTM glucose forecaster for Track B. Run this on your machine after
-`pip install torch`. Not tested in the sandbox this was written in (no
-internet there to install torch) -- test it yourself and tell me what
-happens.
+LSTM glucose forecaster for Track B (v2).
 
-Run: python src/models/train_lstm.py
+Run:  python src/models/train_lstm.py            (full, several minutes)
+      python src/models/train_lstm.py --quick    (1 seed, fewer epochs)
 
-What it does, in order:
-  1. Build the same real+augmented glucose windows as train_track_b.py.
-  2. Train a small LSTM: last 4 readings in, 5th reading predicted.
-  3. Test with leave-one-patient-out -- test only on real data, and never
-     split one patient's windows across train and test.
-  4. Print the same error metric as train_track_b.py (mean absolute error
-     in mg/dL) so you can directly compare LSTM vs Ridge vs Gradient
-     Boosting vs Naive.
-  5. Save the best-epoch model and register it.
+Changes vs v1 (each targets a specific weakness):
+  - predicts the CHANGE from the last reading (starts at the naive baseline)
+  - L1-style loss (matches the MAE metric)
+  - time gaps between readings (and the gap to the target) as inputs
+  - mini-batches, AdamW weight decay, gradient clipping, early stopping on
+    held-out training PATIENTS, and an ensemble of seeds
+  - per-patient loss balancing so one long stay doesn't dominate
+  - time-warp now warps only the timing, never the values (off by default)
+  - naive and Ridge are scored on the SAME windows and folds, so the
+    comparison is apples to apples
+
+Change ONE flag at a time and compare. With 35 patients, tuning many knobs
+against the leave-one-patient-out score will overfit the evaluation itself.
 """
 
 import sys
-import pickle
 from pathlib import Path
+from collections import Counter
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from config import MIMIC_TRAJECTORIES, MODELS_SAVED
-from src.features.augmentation import jitter, window_slice, time_warp
+from src.features.augmentation import jitter, time_warp
 from src.storage.db import init_db, register_model_version, promote_model
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+from sklearn.linear_model import Ridge
 from sklearn.model_selection import LeaveOneGroupOut
-from sklearn.preprocessing import StandardScaler
 
-WINDOW = 5      # 4 readings in, 1 predicted
-STRIDE = 1      # small stride = more overlapping windows from the same real data
+# ---- experiment flags -------------------------------------------------------
+WINDOW = 5                # 4 readings in, 1 predicted
+STRIDE = 1
 JITTER_COPIES = 4
+USE_TIME_WARP = False     # timing-only warp; try True as an ablation
 TIME_WARP_COPIES = 2
-HIDDEN_SIZE = 16   # deliberately small -- this is a ~30-patient dataset, a big
-                   # LSTM will just memorize it. Do not raise this without a
-                   # reason.
-EPOCHS = 60
-LEARNING_RATE = 0.01
+USE_TIME = True           # feed time gaps (NOTE: the API does not send times yet)
+BALANCE_PATIENTS = True   # weight = 1/sqrt(windows per patient)
+HIDDEN = 32
+DROPOUT = 0.2
+WEIGHT_DECAY = 1e-3
+LR = 3e-3
+BATCH = 128
+MAX_EPOCHS = 60
+PATIENCE = 8
+SEEDS = 3
+VAL_PATIENTS = 4          # training patients held out for early stopping
+LOSS = nn.SmoothL1Loss(reduction="none", beta=0.05)   # ~L1, smooth near 0
+
+if "--quick" in sys.argv:
+    SEEDS, MAX_EPOCHS = 1, 30
 
 
 class GlucoseLSTM(nn.Module):
-    """Takes 4 past readings, predicts the 5th. Input shape: (batch, 4, 1)."""
-    def __init__(self, hidden_size=HIDDEN_SIZE):
+    """Input (batch, 4, 2): [scaled glucose, scaled log time-gap]. Output: scaled change from last reading."""
+    def __init__(self):
         super().__init__()
-        self.lstm = nn.LSTM(input_size=1, hidden_size=hidden_size, num_layers=1, batch_first=True)
-        self.head = nn.Linear(hidden_size, 1)
+        self.lstm = nn.LSTM(input_size=2, hidden_size=HIDDEN, num_layers=1, batch_first=True)
+        self.drop = nn.Dropout(DROPOUT)
+        self.head = nn.Linear(HIDDEN + 1, 1)   # +1 = gap between last input and target
 
-    def forward(self, x):
+    def forward(self, x, horizon):
         _, (h_n, _) = self.lstm(x)
-        return self.head(h_n[-1]).squeeze(-1)
+        h = torch.cat([self.drop(h_n[-1]), horizon], dim=1)
+        return self.head(h).squeeze(-1)
 
 
-def build_windows(traj_df):
-    """Same logic as train_track_b.py's build_windows, kept in sync deliberately."""
-    glucose = traj_df[traj_df["lab_name"] == "glucose"]
-    sequences, targets, groups, aug = [], [], [], []
-    for pid, g in glucose.groupby("subject_id"):
-        values = g.sort_values("charttime")["valuenum"].tolist()
-        for win in window_slice(values, min_window=WINDOW, stride=STRIDE):
-            if len(win) < WINDOW:
-                continue
-            sequences.append(win[:-1]); targets.append(win[-1]); groups.append(pid); aug.append(False)
-            for copy in jitter(win, n_copies=JITTER_COPIES, seed=1):
-                sequences.append(copy[:-1]); targets.append(copy[-1]); groups.append(pid); aug.append(True)
-            idx = list(range(len(win)))
-            for _ in range(TIME_WARP_COPIES):
-                warped_idx = time_warp(idx, warp_std_frac=0.15, seed=None)
-                warped_vals = [win[min(max(int(round(i)), 0), len(win)-1)] for i in warped_idx]
-                sequences.append(warped_vals[:-1]); targets.append(warped_vals[-1]); groups.append(pid); aug.append(True)
-    return np.array(sequences), np.array(targets), np.array(groups), np.array(aug)
+def load_data(traj_df):
+    g = traj_df[traj_df["lab_name"] == "glucose"].dropna(subset=["valuenum"]).copy()
+    g["charttime"] = pd.to_datetime(g["charttime"])
+    rng = np.random.default_rng(0)
+    X, H, Y, LAST, groups, aug = [], [], [], [], [], []
+
+    def add(vals, hrs, pid, is_aug):
+        vals = np.asarray(vals, float)
+        gaps = np.clip(np.diff(np.asarray(hrs, float), prepend=hrs[0]), 0, None)
+        if not USE_TIME:
+            gaps = np.zeros_like(gaps)
+        step_gap = np.log1p(gaps[:WINDOW - 1]) / 5
+        X.append(np.stack([vals[:WINDOW - 1], step_gap], axis=1))
+        H.append([np.log1p(gaps[WINDOW - 1]) / 5])
+        Y.append(vals[-1]); LAST.append(vals[WINDOW - 2])
+        groups.append(pid); aug.append(is_aug)
+
+    for pid, grp in g.groupby("subject_id"):
+        grp = grp.sort_values("charttime")
+        vals = grp["valuenum"].to_numpy(float)
+        hrs = (grp["charttime"] - grp["charttime"].iloc[0]).dt.total_seconds().to_numpy() / 3600
+        for s in range(0, len(vals) - WINDOW + 1, STRIDE):
+            v, h = vals[s:s + WINDOW], hrs[s:s + WINDOW]
+            add(v, h, pid, False)
+            for c in jitter(v, n_copies=JITTER_COPIES, seed=int(rng.integers(1_000_000_000))):
+                add(c, h, pid, True)
+            if USE_TIME_WARP:
+                for _ in range(TIME_WARP_COPIES):
+                    add(v, time_warp(h - h[0], seed=int(rng.integers(1_000_000_000))), pid, True)
+
+    D = SimpleNamespace(x=np.array(X), h=np.array(H), y=np.array(Y), last=np.array(LAST),
+                        groups=np.array(groups), aug=np.array(aug))
+    real = ~D.aug
+    D.mu, D.sd = float(D.y[real].mean()), float(D.y[real].std())
+    counts = Counter(D.groups[real])
+    D.w = np.array([1 / np.sqrt(counts[p]) if BALANCE_PATIENTS else 1.0 for p in D.groups])
+    return D
 
 
-def train_one_fold(X_train, y_train, scaler):
-    """Trains a fresh small LSTM on one fold's training data."""
-    X_scaled = scaler.transform(X_train.reshape(-1, 1)).reshape(X_train.shape)
-    x_t = torch.tensor(X_scaled, dtype=torch.float32).unsqueeze(-1)  # (n, 4, 1)
-    y_t = torch.tensor(scaler.transform(y_train.reshape(-1, 1)).flatten(), dtype=torch.float32)
+def tensors(D, idx):
+    xs = D.x[idx].copy()
+    xs[:, :, 0] = (xs[:, :, 0] - D.mu) / D.sd
+    return (torch.tensor(xs, dtype=torch.float32),
+            torch.tensor(D.h[idx], dtype=torch.float32),
+            torch.tensor((D.y[idx] - D.last[idx]) / D.sd, dtype=torch.float32),
+            torch.tensor(D.w[idx], dtype=torch.float32))
 
+
+def fit(D, idx_train, idx_val=None, seed=0, fixed_epochs=None):
+    torch.manual_seed(seed)
     model = GlucoseLSTM()
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    loss_fn = nn.MSELoss()
+    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    xt, ht, yt, wt = tensors(D, idx_train)
+    val = tensors(D, idx_val) if idx_val is not None and len(idx_val) else None
+    n, best_v, best_state, best_ep, bad = len(yt), float("inf"), None, 0, 0
+    epochs = fixed_epochs or MAX_EPOCHS
+    for ep in range(1, epochs + 1):
+        model.train()
+        perm = torch.randperm(n)
+        for i in range(0, n, BATCH):
+            b = perm[i:i + BATCH]
+            opt.zero_grad()
+            loss = (LOSS(model(xt[b], ht[b]), yt[b]) * wt[b]).sum() / wt[b].sum()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+        if val is not None:
+            model.eval()
+            with torch.no_grad():
+                v = (model(val[0], val[1]) - val[2]).abs().mean().item()
+            if v < best_v - 1e-4:
+                best_v, best_ep, bad = v, ep, 0
+                best_state = {k: t.clone() for k, t in model.state_dict().items()}
+            else:
+                bad += 1
+                if bad >= PATIENCE:
+                    break
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model, (best_ep or epochs)
 
-    model.train()
-    for _ in range(EPOCHS):
-        optimizer.zero_grad()
-        pred = model(x_t)
-        loss = loss_fn(pred, y_t)
-        loss.backward()
-        optimizer.step()
-    return model
 
-
-def predict_fold(model, X_test, scaler):
-    X_scaled = scaler.transform(X_test.reshape(-1, 1)).reshape(X_test.shape)
-    x_t = torch.tensor(X_scaled, dtype=torch.float32).unsqueeze(-1)
-    model.eval()
+def predict(models, D, idx):
+    xs, hs, _, _ = tensors(D, idx)
     with torch.no_grad():
-        pred_scaled = model(x_t).numpy()
-    return scaler.inverse_transform(pred_scaled.reshape(-1, 1)).flatten()
+        delta = torch.stack([m.eval()(xs, hs) for m in models]).mean(0).numpy()
+    return D.last[idx] + delta * D.sd
+
+
+def flat(D, idx):
+    w = D.x[idx, :, 0]
+    return np.column_stack([w, w.mean(1), w.std(1), w[:, -1] - w[:, 0]])
+
+
+def summarize(name, errs, pids):
+    errs, pids = np.array(errs), np.array(pids)
+    macro = np.mean([errs[pids == p].mean() for p in np.unique(pids)])
+    print(f"  {name:22s} pooled MAE {errs.mean():6.1f}   per-patient MAE {macro:6.1f}")
+    return float(errs.mean())
 
 
 def main():
-    traj = pd.read_csv(MIMIC_TRAJECTORIES)
-    X, y, groups, aug = build_windows(traj)
-    print(f"Real patients: {len(set(groups))} | real windows: {int((~aug).sum())} | "
-          f"total examples with augmentation: {len(y)}")
+    D = load_data(pd.read_csv(MIMIC_TRAJECTORIES))
+    real = ~D.aug
+    print(f"Real patients: {len(set(D.groups))} | real windows: {int(real.sum())} | "
+          f"total examples with augmentation: {len(D.y)}")
+    print(f"Flags: time={USE_TIME} warp={USE_TIME_WARP} balance={BALANCE_PATIENTS} "
+          f"hidden={HIDDEN} seeds={SEEDS}")
 
-    scaler = StandardScaler().fit(X.reshape(-1, 1))  # fit on ALL data's scale, this is just a
-                                                        # unit conversion, not a leak
-
-    logo = LeaveOneGroupOut()
-    errors = []
-    for train_idx, test_idx in logo.split(X, y, groups):
-        test_idx = test_idx[~aug[test_idx]]  # test on real windows only
-        if len(test_idx) == 0:
+    rng = np.random.default_rng(42)
+    errs = {"Naive (last value)": [], "Ridge": [], "LSTM v2": []}
+    pids, best_epochs = [], []
+    for fold, (tr, te) in enumerate(LeaveOneGroupOut().split(D.x, D.y, D.groups), 1):
+        te = te[real[te]]                       # test on real windows only
+        if len(te) == 0:
             continue
-        model = train_one_fold(X[train_idx], y[train_idx], scaler)
-        pred = predict_fold(model, X[test_idx], scaler)
-        errors.extend(np.abs(pred - y[test_idx]))
+        train_patients = np.unique(D.groups[tr])
+        val_patients = rng.choice(train_patients, size=min(VAL_PATIENTS, len(train_patients) - 1), replace=False)
+        in_val = np.isin(D.groups[tr], val_patients)
+        tr_fit, tr_val = tr[~in_val], tr[in_val & real[tr]]
 
-    mae = float(np.mean(errors))
-    print(f"\nLSTM mean absolute error: {mae:.1f} mg/dL")
-    print("Compare against train_track_b.py's numbers:")
-    print("  Naive (repeat last value): 65.4")
-    print("  Linear (Ridge):            57.6")
-    print("  Gradient Boosting:         65.8")
-    if mae < 57.6:
-        print("  -> LSTM is the new best model.")
-    else:
-        print("  -> LSTM did not beat Ridge. That's a real, reportable result on this small dataset.")
+        models = []
+        for s in range(SEEDS):
+            m, ep = fit(D, tr_fit, tr_val, seed=s)
+            models.append(m); best_epochs.append(ep)
 
-    # train the final model on ALL data (real + augmented) and save it
-    final_model = train_one_fold(X, y, scaler)
+        y_te = D.y[te]
+        errs["Naive (last value)"].extend(np.abs(D.last[te] - y_te))
+        ridge = Ridge(alpha=1.0).fit(flat(D, tr), D.y[tr])
+        errs["Ridge"].extend(np.abs(ridge.predict(flat(D, te)) - y_te))
+        errs["LSTM v2"].extend(np.abs(predict(models, D, te) - y_te))
+        pids.extend(D.groups[te])
+        if fold % 5 == 0:
+            print(f"  ... {fold} folds done")
+
+    print("\nLeave-one-patient-out results, same windows for every model (mg/dL, lower is better):")
+    res = {name: summarize(name, e, pids) for name, e in errs.items()}
+    print("Pooled = comparable to earlier numbers. Per-patient = every patient counts equally.")
+
+    # final model: train on everything, fixed epochs from the folds' early-stopping points
+    final_epochs = int(np.median(best_epochs))
+    all_idx = np.arange(len(D.y))
+    finals = [fit(D, all_idx, None, seed=s, fixed_epochs=final_epochs)[0] for s in range(SEEDS)]
     MODELS_SAVED.mkdir(parents=True, exist_ok=True)
-    torch.save(final_model.state_dict(), MODELS_SAVED / "mimic_lstm_forecaster.pt")
-    with open(MODELS_SAVED / "mimic_lstm_scaler.pkl", "wb") as f:
-        pickle.dump(scaler, f)
-    print(f"\nSaved LSTM weights to {MODELS_SAVED / 'mimic_lstm_forecaster.pt'}")
+    path = MODELS_SAVED / "mimic_lstm_forecaster.pt"
+    torch.save({"states": [m.state_dict() for m in finals],
+                "config": {"mu": D.mu, "sd": D.sd, "hidden": HIDDEN, "dropout": DROPOUT,
+                           "use_time": USE_TIME, "window": WINDOW}}, path)
+    print(f"\nSaved {SEEDS}-model ensemble ({final_epochs} epochs each) to {path}")
 
     init_db()
     version_id = register_model_version(
         model_name="mimic_glucose_forecaster_lstm",
-        n_original_rows=int((~aug).sum()), n_app_rows=0,
-        val_auc=0.0, val_f1=0.0,
-        notes=f"LSTM, hidden={HIDDEN_SIZE}, mean abs error {mae:.1f} mg/dL, LOPO-CV",
-    )
+        n_original_rows=int(real.sum()), n_app_rows=0, val_auc=0.0, val_f1=0.0,
+        notes=(f"LSTM v2 residual, hidden={HIDDEN}, time={USE_TIME}, seeds={SEEDS}, "
+               f"mean abs error {res['LSTM v2']:.1f} mg/dL (pooled), LOPO-CV"))
     promote_model(version_id, "mimic_glucose_forecaster_lstm")
     print(f"Registered as mimic_glucose_forecaster_lstm, version {version_id}")
 

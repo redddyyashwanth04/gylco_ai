@@ -28,10 +28,11 @@ def load_active_model():
 
 
 def add_engineered_features(p):
-    """Same feature engineering used in training -- must stay in sync with feature_engineering.py."""
+    """Same feature engineering used in training -- must stay in sync with feature_engineering.py.
+    None-safe: an empty optional field arrives as None and must not crash comparisons."""
     p = dict(p)
     hdl = p.get("LBDHDD")
-    if hdl and hdl != 0:
+    if hdl:
         triglycerides = p.get("LBXTLG")
         ldl = p.get("LBDLDL")
         total_chol = p.get("LBXTC")
@@ -43,31 +44,32 @@ def add_engineered_features(p):
         if total_chol is not None:
             p["TC_HDL_RATIO"] = total_chol / hdl
 
-    p["PREDIABETES_FLAG"] = int(5.7 <= p.get("LBXGH", 0) <= 6.4 or 100 <= p.get("LBXGLU", 0) <= 125)
-    p["LAB_HYPERTENSION_FLAG"] = int(p.get("BPXOSY1", 0) >= 130 or p.get("BPXODI1", 0) >= 80)
+    hba1c = p.get("LBXGH") or 0
+    glucose = p.get("LBXGLU") or 0
+    p["PREDIABETES_FLAG"] = int(5.7 <= hba1c <= 6.4 or 100 <= glucose <= 125)
+    p["LAB_HYPERTENSION_FLAG"] = int((p.get("BPXOSY1") or 0) >= 130 or (p.get("BPXODI1") or 0) >= 80)
     return p
 
 
 def predict_patient(patient_values):
     """
-    patient_values: dict of raw NHANES-style values (any missing ones are
-    filled with the training-set typical value, so partial input still works).
-    Returns: dict like {"hypertension": 0.62, "nephropathy": 0.18, ...}
+    patient_values: dict of raw NHANES-style values (missing ones are filled
+    with training medians, so partial input still works).
+    Returns: (risks dict, model name, feature frame)
     """
     name, model, feature_cols = load_active_model()
     row = add_engineered_features(patient_values)
     x = pd.DataFrame([row]).reindex(columns=feature_cols)
 
-    # fill anything the clinician didn't enter with the training medians
     train = pd.read_csv(Path(__file__).resolve().parent.parent.parent / "data" / "model_ready" / "nhanes_model_ready.csv")
     x = x.fillna(train[feature_cols].median())
 
-    probas = model.predict_proba(x)  # list of arrays, one per target
+    probas = model.predict_proba(x)
     return {t: float(probas[i][0, 1]) for i, t in enumerate(TARGETS)}, name, x
 
 
 def compute_risk_delta(current_risks, previous_risks):
-    """Return a risk delta and human-readable trend direction for doctor-facing comparisons."""
+    """Return a risk delta and trend direction for clinician-facing comparisons."""
     if not previous_risks:
         total = sum(current_risks.values()) / len(current_risks) if current_risks else 0.0
         return round(float(total), 4), "new-patient"
@@ -87,29 +89,34 @@ def compute_risk_delta(current_risks, previous_risks):
 
 
 def generate_clinical_recommendations(patient_values, risks):
-    """Doctor-facing follow-up suggestions based on current risk and the clinician's values."""
+    """
+    Points for clinician review. These are considerations, not orders: the
+    tool supports the clinician's decision and never makes it.
+    """
     recs = []
     bmi = patient_values.get("BMXBMI") or 0
     hba1c = patient_values.get("LBXGH") or 0
     glucose = patient_values.get("LBXGLU") or 0
     systolic = patient_values.get("BPXOSY1") or 0
     diastolic = patient_values.get("BPXODI1") or 0
+    hdl = patient_values.get("LBDHDD")
+    total_chol = patient_values.get("LBXTC")
 
     if risks.get("hypertension", 0) >= 0.5 or systolic >= 130 or diastolic >= 80:
-        recs.append("Hypertension risk is elevated. Review blood pressure control, verify home readings, and confirm medication adherence before the next follow-up visit.")
-    if risks.get("nephropathy", 0) >= 0.5 or hba1c >= 7 or glucose >= 140:
-        recs.append("Nephropathy risk is concerning. Check albuminuria and kidney function and consider earlier renal review if the risk trend is rising.")
-    if risks.get("cardiovascular", 0) >= 0.5 or bmi >= 30 or (patient_values.get("LBDHDD") and patient_values.get("LBXTC") and patient_values["LBXTC"] / patient_values["LBDHDD"] > 5):
-        recs.append("Cardiovascular risk is elevated. Prioritize lipid control, consider statin suitability, and review smoking, activity, and nutrition with the patient.")
+        recs.append("Hypertension risk is elevated. Consider reviewing blood pressure control, home readings, and medication adherence.")
+    if risks.get("nephropathy", 0) >= 0.5:
+        recs.append("Estimated nephropathy risk is elevated. Consider reviewing albuminuria and kidney function results, and whether earlier renal review is warranted if the risk trend is rising.")
+    if risks.get("cardiovascular", 0) >= 0.5 or bmi >= 30 or (hdl and total_chol and total_chol / hdl > 5):
+        recs.append("Cardiovascular risk markers are elevated. Consider reviewing lipid management, smoking, activity, and nutrition with the patient.")
     if bmi >= 30:
-        recs.append("Lifestyle intervention should be a key part of management. Reinforce weight-loss targets, activity goals, and meal-planning support.")
+        recs.append("BMI is in the obesity range. Lifestyle support (activity, meal planning, weight goals) may be worth discussing.")
     if hba1c >= 7 or glucose >= 140:
-        recs.append("Glycemic risk is elevated. Reassess medication adherence and schedule a follow-up in 6–12 weeks or sooner if the trend is worsening.")
+        recs.append("Glycemic markers are above common targets. Consider reviewing adherence and the follow-up interval; timing is a clinical judgment.")
 
     if not recs:
-        recs.append("Current risk is low-to-moderate. Continue routine monitoring and repeat reassessment at the next planned clinic visit.")
+        recs.append("Current estimated risk is low to moderate. Routine monitoring at the next planned visit may be appropriate.")
 
-    recs.append("For a real consultation, document the risk trend over time, align the plan with patient goals, and schedule follow-up based on the direction of change.")
+    recs.append("Document the risk trend across visits and align the plan with patient goals. Follow-up timing remains the clinician's decision.")
     return recs
 
 

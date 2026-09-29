@@ -14,7 +14,7 @@
 <body>
   <div class="app-shell">
     <aside class="sidebar" aria-label="Primary navigation">
-      <a class="brand" href="#assessment" aria-label="Carepath home">
+      <a class="brand" href="#overview" aria-label="Carepath home">
         <span class="brand-mark" aria-hidden="true">+</span>
         <span><strong>carepath</strong><small>CLINICIAN WORKSPACE</small></span>
       </a>
@@ -27,7 +27,8 @@
 
       <p class="nav-label">WORKSPACE</p>
       <nav class="nav-list">
-        <button class="nav-item active" type="button" data-view="assessment"><span class="nav-icon">◫</span>Current assessment</button>
+        <button class="nav-item active" type="button" data-view="overview"><span class="nav-icon">⌂</span>Overview</button>
+        <button class="nav-item" type="button" data-view="assessment"><span class="nav-icon">◫</span>Current assessment</button>
         <button class="nav-item" type="button" data-view="trajectory"><span class="nav-icon">⌁</span>Progression forecast</button>
         <button class="nav-item" type="button" data-view="history"><span class="nav-icon">▤</span>Patient history <span class="nav-count" id="visit-count">0</span></button>
         <button class="nav-item" type="button" data-view="models"><span class="nav-icon">◎</span>Model transparency</button>
@@ -41,7 +42,7 @@
 
     <main class="main-area">
       <header class="topbar">
-        <div class="breadcrumb"><span>Care workspace</span><span class="slash">/</span><strong id="current-section">Current assessment</strong></div>
+        <div class="breadcrumb"><span>Care workspace</span><span class="slash">/</span><strong id="current-section">Overview</strong></div>
         <div class="topbar-actions">
           <span class="preview-pill" id="backend-pill"><span class="status-dot" id="backend-status-dot"></span><span id="backend-pill-label">CONNECTING</span></span>
           <button class="icon-button" id="help-button" type="button" aria-label="About this preview" title="About this preview">?</button>
@@ -54,7 +55,56 @@
         <button type="button" class="banner-dismiss" id="connection-dismiss" aria-label="Dismiss message">×</button>
       </div>
 
-      <section class="view active" id="view-assessment" aria-labelledby="assessment-title">
+      <!-- OVERVIEW -->
+      <section class="view active" id="view-overview" aria-labelledby="overview-title">
+        <div class="page-heading">
+          <div>
+            <p class="eyebrow">TYPE 2 DIABETES <span>·</span> DECISION SUPPORT</p>
+            <h1 id="overview-title">Overview</h1>
+            <p class="subheading">Clinician-facing decision support. Patients are the beneficiaries of better decisions, not users of this tool.</p>
+          </div>
+          <button class="primary-button" type="button" data-goto="assessment">Start an assessment <span aria-hidden="true">→</span></button>
+        </div>
+
+        <div class="tile-grid">
+          <article class="panel tile"><small>TRACK A · CURRENT RISK</small><strong id="ov-a-model">—</strong><span id="ov-a-detail">Checking…</span></article>
+          <article class="panel tile"><small>TRACK B · GLUCOSE FORECAST</small><strong id="ov-b-model">—</strong><span id="ov-b-detail">Checking…</span></article>
+          <article class="panel tile"><small>PATIENTS TRACKED</small><strong id="ov-patients">—</strong><span id="ov-patients-detail">In the local database</span></article>
+          <article class="panel tile"><small>PREDICTIONS LOGGED</small><strong id="ov-predictions">—</strong><span>Audit trail with model version</span></article>
+        </div>
+
+        <div class="assessment-grid">
+          <section class="panel input-panel">
+            <div class="panel-heading"><div><h2>How it works</h2><p>Two modes, each with an explanation.</p></div></div>
+            <div class="form-section">
+              <h3>Current assessment</h3>
+              <p class="muted-copy">Enter today's measurements. The model returns estimated risk for hypertension, nephropathy and cardiovascular outcomes, the factors driving each estimate (SHAP), and a plain-language summary.</p>
+            </div>
+            <div class="form-section">
+              <h3>Progression forecast</h3>
+              <p class="muted-copy">View a glucose trajectory from a tracked patient or a pre-loaded MIMIC-IV demo case, with the model's next-reading forecast plotted after the last observation, along with its typical error.</p>
+            </div>
+            <div class="form-section last-section">
+              <h3>Your judgment stays in charge</h3>
+              <p class="muted-copy">Outputs are estimates and points for review. The clinician makes every decision.</p>
+            </div>
+          </section>
+          <aside class="review-column">
+            <section class="panel review-panel">
+              <div class="review-heading"><div><p class="eyebrow">HONEST LIMITS</p><h2>What this is not</h2></div></div>
+              <ul class="recommendation-list">
+                <li>A research prototype, not a validated or approved medical device.</li>
+                <li>Track A is trained on NHANES survey data; labels are largely self-reported.</li>
+                <li>Track B is trained on 35 ICU patients (MIMIC-IV Demo), augmented. It is a proof of concept, and outpatient use is out of distribution.</li>
+                <li>Model retraining from app data is designed but not yet enabled.</li>
+              </ul>
+            </section>
+          </aside>
+        </div>
+      </section>
+
+      <!-- CURRENT ASSESSMENT -->
+      <section class="view" id="view-assessment" aria-labelledby="assessment-title">
         <div class="page-heading">
           <div>
             <p class="eyebrow">ENCOUNTER WORKSPACE <span>·</span> TODAY</p>
@@ -67,7 +117,7 @@
         <div class="workflow-strip" aria-label="Assessment steps">
           <div class="workflow-step active"><span>1</span><div><strong>Patient & measurements</strong><small>Enter current encounter values</small></div></div>
           <span class="workflow-line"></span>
-          <div class="workflow-step"><span>2</span><div><strong>Clinical review</strong><small>Model output unavailable</small></div></div>
+          <div class="workflow-step"><span>2</span><div><strong>Clinical review</strong><small>Estimates and drivers</small></div></div>
           <span class="workflow-line"></span>
           <div class="workflow-step"><span>3</span><div><strong>Follow-up</strong><small>Clinician-led decision</small></div></div>
         </div>
@@ -139,9 +189,18 @@
               <p class="disclaimer">Decision-support prototype only. Not for diagnosis or treatment decisions.</p>
             </section>
 
+            <section class="panel review-panel" id="explain-panel" hidden>
+              <div class="review-heading"><div><p class="eyebrow">WHY THIS ESTIMATE</p><h2>Top drivers</h2></div></div>
+              <div class="chip-row" id="explain-tabs"></div>
+              <div id="explain-bars"></div>
+              <p class="muted-copy" id="explain-narrative"></p>
+              <p class="tiny-note" id="explain-source"></p>
+              <p class="tiny-note">Bars show each factor's shift in estimated probability (SHAP). Orange raises the estimate, green lowers it. "Typical value assumed" means the field was not entered.</p>
+            </section>
+
             <section class="panel follow-up-panel">
-              <div class="panel-heading compact"><div><p class="eyebrow">CARE PLAN</p><h2>Clinician follow-up</h2></div><span class="plan-icon">＋</span></div>
-              <p class="muted-copy" id="recommendation-empty">Model recommendations will appear after a successful assessment.</p>
+              <div class="panel-heading compact"><div><p class="eyebrow">FOR YOUR REVIEW</p><h2>Points for clinician review</h2></div><span class="plan-icon">＋</span></div>
+              <p class="muted-copy" id="recommendation-empty">Points for review will appear after a successful assessment.</p>
               <ul class="recommendation-list" id="recommendation-list" hidden></ul>
               <label class="field note-field"><span>Visit note <em>Session only</em></span><textarea id="visit-note" rows="3" placeholder="Add a note for this temporary preview…"></textarea></label>
               <button class="secondary-button" type="button" id="save-visit-button" disabled>Save visit</button>
@@ -151,9 +210,10 @@
         </div>
       </section>
 
+      <!-- PROGRESSION FORECAST -->
       <section class="view" id="view-trajectory" aria-labelledby="trajectory-title">
         <div class="page-heading">
-          <div><p class="eyebrow">LONGITUDINAL VIEW <span>·</span> TRACK B</p><h1 id="trajectory-title">Progression forecast</h1><p class="subheading">Review glucose measurements over time. Forecasts require the Python trajectory model service.</p></div>
+          <div><p class="eyebrow">LONGITUDINAL VIEW <span>·</span> TRACK B</p><h1 id="trajectory-title">Progression forecast</h1><p class="subheading">Review glucose measurements over time and forecast the next reading with the trajectory model.</p></div>
           <span class="preview-tag" id="forecast-badge">Forecast status</span>
         </div>
         <div class="trajectory-toolbar panel">
@@ -164,30 +224,35 @@
         </div>
         <div class="panel chart-panel">
           <div class="panel-heading"><div><h2>Glucose history</h2><p id="chart-caption">Illustrative values only · not patient data</p></div><span class="chart-legend"><i></i>Recorded glucose</span></div>
-          <div class="chart-wrap"><canvas id="glucose-chart" aria-label="Glucose history chart"></canvas><div class="chart-empty" id="chart-empty" hidden>No session visits with glucose values yet.</div></div>
-          <div class="chart-foot"><span>Reference range shown for context only</span><span>mg/dL</span></div>
+          <div class="chart-wrap"><canvas id="glucose-chart" aria-label="Glucose history chart"></canvas><div class="chart-empty" id="chart-empty" hidden>No saved glucose measurements for this patient.</div></div>
+          <div class="chart-foot"><span>Dashed line: 140 mg/dL reference. Orange point: forecast, with typical error bar.</span><span>mg/dL</span></div>
         </div>
         <div class="forecast-result" id="forecast-result" hidden></div>
-        <div class="connection-note" id="forecast-note"><span class="banner-symbol">i</span><p><strong>Forecast is model-generated.</strong> Use a tracked visit sequence with at least four glucose measurements. Synthetic sample values are labeled separately and are not patient data.</p></div>
+        <div class="connection-note" id="forecast-note"><span class="banner-symbol">i</span><p><strong>Forecast is model-generated.</strong> The forecaster was trained on ICU point-of-care glucose (MIMIC-IV Demo, 35 patients); applying it to outpatient fasting glucose is out-of-distribution. The error bar is the typical error from leave-one-patient-out testing. At least four glucose readings are needed.</p></div>
       </section>
 
+      <!-- PATIENT HISTORY -->
       <section class="view" id="view-history" aria-labelledby="history-title">
-        <div class="page-heading"><div><p class="eyebrow">ENCOUNTER RECORDS</p><h1 id="history-title">Patient history</h1><p class="subheading" id="history-description">Saved visits from the local patient database.</p></div><label class="search-box"><span aria-hidden="true">⌕</span><input id="history-search" type="search" placeholder="Search patient ID" aria-label="Search patient ID"></label></div>
+        <div class="page-heading"><div><p class="eyebrow">ENCOUNTER RECORDS</p><h1 id="history-title">Patient history</h1><p class="subheading" id="history-description">Saved visits from the local patient database. Select a patient to open their trajectory.</p></div><label class="search-box"><span aria-hidden="true">⌕</span><input id="history-search" type="search" placeholder="Search patient ID" aria-label="Search patient ID"></label></div>
         <div class="history-summary"><div><span class="summary-number" id="history-total">0</span><span>recorded visits</span></div><span class="session-label" id="history-state"><span class="status-dot"></span>Local database</span></div>
         <div class="panel table-panel">
-          <div class="table-scroll"><table><thead><tr><th>Patient</th><th>Visit date</th><th>HbA1c</th><th>Glucose</th><th>BMI</th><th>Blood pressure</th><th>Risk record</th></tr></thead><tbody id="history-rows"></tbody></table></div>
+          <div class="table-scroll"><table><thead><tr><th>Patient</th><th>Visit date</th><th>HbA1c</th><th>Glucose</th><th>BMI</th><th>Blood pressure</th><th>Risk snapshot (H · N · C)</th></tr></thead><tbody id="history-rows"></tbody></table></div>
           <div class="table-empty" id="history-empty"><div class="empty-symbol"><span>▤</span></div><strong id="history-empty-title">No visits recorded yet</strong><p id="history-empty-copy">Review a visit and save it with a patient ID to add it to the local patient history.</p><button type="button" class="text-button" data-goto="assessment">Start an assessment <span aria-hidden="true">→</span></button></div>
         </div>
       </section>
 
+      <!-- MODEL TRANSPARENCY -->
       <section class="view" id="view-models" aria-labelledby="models-title">
         <div class="page-heading"><div><p class="eyebrow">MODEL GOVERNANCE</p><h1 id="models-title">Model transparency</h1><p class="subheading">Active model artifacts and validation records from the local registry.</p></div><span class="preview-tag" id="registry-badge">Checking registry</span></div>
         <div class="model-overview"><div><span class="overview-label">LIVE REGISTRY</span><strong id="registry-status">Loading registry…</strong><small id="registry-detail">Reading registered versions from the local SQLite database</small></div><span class="registry-mark">◎</span></div>
         <div class="model-list">
           <article class="panel model-card"><div class="model-card-top"><span class="model-symbol teal">A</span><span class="status-chip unavailable" id="track-a-status">Checking</span></div><p class="eyebrow">TRACK A · CURRENT RISK</p><h2>NHANES complication model</h2><p>Multi-label estimates for hypertension, nephropathy, and cardiovascular outcomes, based on current patient values.</p><div class="model-meta"><span>Source <strong>NHANES</strong></span><span>Validation <strong id="track-a-validation">Unavailable</strong></span><span>Active version <strong id="track-a-version">Checking</strong></span></div></article>
-          <article class="panel model-card"><div class="model-card-top"><span class="model-symbol coral">B</span><span class="status-chip unavailable" id="track-b-status">Checking</span></div><p class="eyebrow">TRACK B · GLUCOSE TRAJECTORY</p><h2>MIMIC-IV glucose forecaster</h2><p>Longitudinal forecasting based on a patient's sequence of glucose measurements.</p><div class="model-meta"><span>Source <strong>MIMIC-IV Demo</strong></span><span>Validation <strong id="track-b-validation">Unavailable</strong></span><span>Active version <strong id="track-b-version">Checking</strong></span></div></article>
+          <article class="panel model-card"><div class="model-card-top"><span class="model-symbol coral">B</span><span class="status-chip unavailable" id="track-b-status">Checking</span></div><p class="eyebrow">TRACK B · GLUCOSE TRAJECTORY</p><h2>MIMIC-IV glucose forecaster</h2><p>Forecasts the next glucose reading from the previous four. Error is leave-one-patient-out mean absolute error.</p><div class="model-meta"><span>Source <strong>MIMIC-IV Demo</strong></span><span>Validation <strong id="track-b-validation">Unavailable</strong></span><span>Active version <strong id="track-b-version">Checking</strong></span></div></article>
         </div>
-        <div class="connection-note"><span class="banner-symbol">i</span><p>Registry metrics come from the local SQLite registry. The model artifact's name is also checked at runtime before an assessment.</p></div>
+        <div class="panel table-panel registry-table">
+          <div class="table-scroll"><table><thead><tr><th>Model</th><th>Version</th><th>Trained</th><th>Original / app rows</th><th>Validation</th><th>Status</th></tr></thead><tbody id="registry-rows"></tbody></table></div>
+        </div>
+        <div class="connection-note"><span class="banner-symbol">i</span><p>Registry metrics come from the local SQLite registry. Retraining from app-collected data is designed (validation-gated promotion) but not yet enabled.</p></div>
       </section>
 
       <footer class="app-footer"><span>Carepath prototype</span><span>Research decision-support preview <i>·</i> Not a medical device</span></footer>

@@ -1,16 +1,24 @@
 const navButtons = [...document.querySelectorAll(".nav-item[data-view]")];
 const views = [...document.querySelectorAll(".view")];
 const pageNames = {
+  overview: "Overview",
   assessment: "Current assessment",
   trajectory: "Progression forecast",
   history: "Patient history",
   models: "Model transparency",
 };
-const visits = [];
-let pendingVisit = null;
-let toastTimer;
+const TARGETS = ["hypertension", "nephropathy", "cardiovascular"];
 const API_BASE = `${window.location.protocol}//${window.location.hostname}:5001/api`;
 const DEMO_SESSION_KEY = "carepath_demo_user";
+
+const visits = [];        // saved visits from the local database
+const tempVisits = [];    // visits without a patient ID, browser memory only
+let mimicCases = [];
+let pendingVisit = null;
+let forecastState = null;
+let explainResult = null;
+let explainTarget = "hypertension";
+let toastTimer;
 let backendConnected = false;
 let forecastAvailable = false;
 
@@ -19,6 +27,13 @@ const valueOf = (id) => {
   const value = byId(id).value.trim();
   return value === "" ? null : Number(value);
 };
+const allVisits = () => [...tempVisits, ...visits];
+
+function escapeHTML(text) {
+  return String(text).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  })[c]);
+}
 
 function showToast(message) {
   const toast = byId("toast");
@@ -33,10 +48,26 @@ async function apiRequest(path, options = {}) {
     ...options,
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },
   });
-  const result = await response.json();
+  let result = {};
+  try { result = await response.json(); } catch { /* non-JSON error body */ }
   if (!response.ok) throw new Error(result.error || `Service request failed (${response.status}).`);
   return result;
 }
+
+function formatDate(date) {
+  if (Number.isNaN(date.getTime())) return "—";
+  return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", year: "numeric" }).format(date);
+}
+
+function metricText(model) {
+  if (model.model_name.startsWith("mimic")) {
+    const match = /mean abs error ([\d.]+)/.exec(model.notes || "");
+    return match ? `MAE ${match[1]} mg/dL` : "Not recorded";
+  }
+  return model.val_auc ? `AUC ${Number(model.val_auc).toFixed(3)}` : "Not recorded";
+}
+
+/* ---------- connection ---------- */
 
 function setConnectionState(connected, message, modelName = "") {
   backendConnected = connected;
@@ -53,20 +84,22 @@ function setConnectionState(connected, message, modelName = "") {
   byId("help-button").title = connected
     ? `Connected to the local Python service using ${modelName}.`
     : "The local Python model service is not responding.";
-  ["sidebar-status-dot", "backend-status-dot"].forEach((id) => {
-    byId(id).classList.toggle("connected", connected);
-  });
+  ["sidebar-status-dot", "backend-status-dot"].forEach((id) => byId(id).classList.toggle("connected", connected));
 }
 
 function normalizeVisit(row) {
+  let risks = null;
+  try { risks = row.risks_json ? JSON.parse(row.risks_json) : null; } catch { risks = null; }
+  const num = (v) => (v === null || v === undefined ? null : Number(v));
   return {
-    patientId: row.patient_id || row.patientId || "",
-    date: new Date(row.visit_date || row.date),
-    hba1c: row.hba1c === null || row.hba1c === undefined ? null : Number(row.hba1c),
-    glucose: row.glucose === null || row.glucose === undefined ? null : Number(row.glucose),
-    bmi: row.bmi === null || row.bmi === undefined ? null : Number(row.bmi),
-    systolic: row.systolic_bp ?? row.systolic ?? null,
-    diastolic: row.diastolic_bp ?? row.diastolic ?? null,
+    patientId: row.patient_id || "",
+    date: new Date(row.visit_date),
+    hba1c: num(row.hba1c),
+    glucose: num(row.glucose),
+    bmi: num(row.bmi),
+    systolic: num(row.systolic_bp),
+    diastolic: num(row.diastolic_bp),
+    risks,
   };
 }
 
@@ -82,22 +115,28 @@ async function loadVisitsFromBackend() {
 function updateTrajectoryOptions() {
   const select = byId("trajectory-patient");
   const selected = select.value;
-  const patients = [...new Set(visits.map((visit) => visit.patientId).filter(Boolean))];
+  const patients = [...new Set(visits.map((v) => v.patientId).filter(Boolean))];
   select.replaceChildren(new Option("Illustrative example (synthetic)", "illustrative"));
-  patients.forEach((patientId) => {
-    select.add(new Option(patientId, `patient:${patientId}`));
-  });
-  if (patients.includes(selected.slice("patient:".length)) && selected.startsWith("patient:")) {
-    select.value = selected;
+  if (mimicCases.length) {
+    const group = document.createElement("optgroup");
+    group.label = "MIMIC-IV demo cases (ICU)";
+    mimicCases.forEach((c) => group.append(new Option(`${c.label} · ${c.totalReadings} readings`, `case:${c.id}`)));
+    select.append(group);
   }
+  if (patients.length) {
+    const group = document.createElement("optgroup");
+    group.label = "Tracked patients";
+    patients.forEach((id) => group.append(new Option(id, `patient:${id}`)));
+    select.append(group);
+  }
+  if ([...select.options].some((o) => o.value === selected)) select.value = selected;
 }
 
 async function loadModelsFromBackend(health) {
   const { models } = await apiRequest("/models");
-  const current = models.find((model) => model.model_name === "nhanes_active" && model.is_active);
-  const trajectory = models.find((model) =>
-    ["mimic_glucose_forecaster", "mimic_glucose_forecaster_lstm"].includes(model.model_name) && model.is_active
-  );
+  const current = models.find((m) => m.model_name === "nhanes_active" && m.is_active);
+  const trajectory = models.find((m) => m.model_name === "mimic_glucose_forecaster" && m.is_active);
+
   byId("registry-status").textContent = models.length
     ? `${models.length} registered model version${models.length === 1 ? "" : "s"}`
     : "Registry connected; no versions registered";
@@ -106,11 +145,38 @@ async function loadModelsFromBackend(health) {
   byId("track-a-status").textContent = current ? "Active" : "Artifact loaded";
   byId("track-a-status").classList.toggle("unavailable", !current);
   byId("track-a-version").textContent = current ? `Version ${current.version_id}` : health.modelName;
-  byId("track-a-validation").textContent = current?.val_auc == null ? "Not recorded" : `AUC ${Number(current.val_auc).toFixed(3)}`;
+  byId("track-a-validation").textContent = current ? metricText(current) : "Not recorded";
   byId("track-b-status").textContent = health.forecastAvailable ? "Artifact available" : "Artifact unavailable";
   byId("track-b-status").classList.toggle("unavailable", !health.forecastAvailable);
   byId("track-b-version").textContent = trajectory ? `Version ${trajectory.version_id}` : "No active registry version";
-  byId("track-b-validation").textContent = trajectory?.val_auc == null ? "Not recorded" : `AUC ${Number(trajectory.val_auc).toFixed(3)}`;
+  byId("track-b-validation").textContent = trajectory ? metricText(trajectory) : "Not recorded";
+
+  byId("registry-rows").innerHTML = models.map((m) => `<tr>
+    <td>${escapeHTML(m.model_name)}</td>
+    <td>v${m.version_id}</td>
+    <td>${formatDate(new Date(m.trained_at))}</td>
+    <td>${m.n_original_rows} / ${m.n_app_rows}</td>
+    <td>${escapeHTML(metricText(m))}</td>
+    <td>${m.is_active ? "Active" : "Archived"}</td>
+  </tr>`).join("") || '<tr><td colspan="6">No versions registered.</td></tr>';
+  return models;
+}
+
+function fillOverview(health, models, info) {
+  const a = models.find((m) => m.model_name === "nhanes_active" && m.is_active);
+  const b = models.find((m) => m.model_name === "mimic_glucose_forecaster" && m.is_active);
+  byId("ov-a-model").textContent = health.modelName.replace(/^nhanes_/, "").replace(/_/g, " ");
+  byId("ov-a-detail").textContent = a ? `Registry v${a.version_id} · ${metricText(a)}` : "Not in registry";
+  byId("ov-b-model").textContent = health.forecastAvailable ? "Ridge forecaster" : "Unavailable";
+  byId("ov-b-detail").textContent = b ? `Registry v${b.version_id} · ${metricText(b)}` : "No active registry version";
+  byId("ov-patients").textContent = info ? String(info.patients.length) : "—";
+  byId("ov-predictions").textContent = info ? String(info.predictionCount) : "—";
+}
+
+function markOverviewOffline() {
+  ["ov-a-model", "ov-b-model", "ov-patients", "ov-predictions"].forEach((id) => { byId(id).textContent = "—"; });
+  byId("ov-a-detail").textContent = "Service offline";
+  byId("ov-b-detail").textContent = "Service offline";
 }
 
 async function connectBackend() {
@@ -119,13 +185,18 @@ async function connectBackend() {
     forecastAvailable = Boolean(health.forecastAvailable);
     setConnectionState(true, `Using ${health.modelName} (${health.featureCount} features). Predictions run locally; this remains a research prototype.`, health.modelName);
     byId("forecast-badge").textContent = forecastAvailable ? "Forecast model available" : "Forecast artifact unavailable";
-    await Promise.all([loadVisitsFromBackend(), loadModelsFromBackend(health)]);
-    byId("history-description").textContent = "Saved visits from the local patient database.";
-    byId("history-state").lastChild.textContent = " Local database";
+
+    try { mimicCases = (await apiRequest("/cases")).cases; } catch { mimicCases = []; }
+    let info = null;
+    try { info = await apiRequest("/patients"); } catch { info = null; }
+
+    const [, models] = await Promise.all([loadVisitsFromBackend(), loadModelsFromBackend(health)]);
+    fillOverview(health, models, info);
+    byId("history-description").textContent = "Saved visits from the local patient database. Select a patient to open their trajectory.";
     updateForecastControls();
   } catch (error) {
     forecastAvailable = false;
-    setConnectionState(false, "Start the local API with .venv/Scripts/python.exe -m src.api_server. The UI will retry when reloaded.");
+    setConnectionState(false, "Start the local API with: python -m src.api_server. The UI retries when reloaded.");
     byId("registry-status").textContent = "Registry unavailable";
     byId("registry-detail").textContent = "Start the local API to read model versions.";
     byId("track-a-status").textContent = "Service offline";
@@ -133,8 +204,11 @@ async function connectBackend() {
     byId("registry-badge").textContent = "Registry unavailable";
     byId("forecast-badge").textContent = "Forecast unavailable";
     byId("forecast-status").textContent = "Service offline";
+    markOverviewOffline();
   }
 }
+
+/* ---------- navigation ---------- */
 
 function navigate(viewName) {
   if (!pageNames[viewName]) return;
@@ -153,17 +227,14 @@ function navigate(viewName) {
 navButtons.forEach((button) => button.addEventListener("click", () => navigate(button.dataset.view)));
 document.querySelector(".brand").addEventListener("click", (event) => {
   event.preventDefault();
-  navigate("assessment");
+  navigate("overview");
 });
 document.querySelectorAll("[data-goto]").forEach((button) => {
   button.addEventListener("click", () => navigate(button.dataset.goto));
 });
 
 byId("today-label").textContent = new Intl.DateTimeFormat(undefined, {
-  weekday: "short",
-  month: "short",
-  day: "numeric",
-  year: "numeric",
+  weekday: "short", month: "short", day: "numeric", year: "numeric",
 }).format(new Date());
 
 byId("help-button").addEventListener("click", () => {
@@ -173,21 +244,16 @@ byId("logout-button").addEventListener("click", () => {
   sessionStorage.removeItem(DEMO_SESSION_KEY);
   window.location.replace("/login.html");
 });
-document.querySelector(".banner-dismiss").addEventListener("click", () => {
-  document.querySelector(".connection-banner").hidden = true;
+byId("connection-dismiss").addEventListener("click", () => {
+  byId("connection-banner").hidden = true;
 });
+
+/* ---------- assessment ---------- */
 
 byId("example-button").addEventListener("click", () => {
   const example = {
-    "patient-id": "DEMO-1042",
-    age: "58",
-    hba1c: "7.4",
-    glucose: "150",
-    bmi: "31.0",
-    systolic: "142",
-    diastolic: "88",
-    ldl: "130",
-    hdl: "42",
+    "patient-id": "DEMO-1042", age: "58", hba1c: "7.4", glucose: "150", bmi: "31.0",
+    systolic: "142", diastolic: "88", ldl: "130", hdl: "42",
   };
   Object.entries(example).forEach(([id, value]) => { byId(id).value = value; });
   pendingVisit = null;
@@ -228,8 +294,7 @@ function setSnapshot(visit) {
     ["Blood pressure", visit.systolic === null || visit.diastolic === null ? "Not entered" : `${visit.systolic}/${visit.diastolic}`],
   ];
   byId("snapshot-list").innerHTML = snapshots.map(([label, value]) =>
-    `<div class="snapshot-item"><span>${label}</span><strong>${value}</strong></div>`
-  ).join("");
+    `<div class="snapshot-item"><span>${label}</span><strong>${value}</strong></div>`).join("");
   byId("review-values").hidden = false;
   byId("model-empty-state").hidden = true;
 }
@@ -238,7 +303,7 @@ function showModelResult(result) {
   byId("model-empty-state").hidden = true;
   byId("model-badge").innerHTML = `<span></span>${escapeHTML(result.modelName)}`;
   byId("model-slots").setAttribute("aria-label", `Risk estimates from ${result.modelName}`);
-  ["hypertension", "nephropathy", "cardiovascular"].forEach((target) => {
+  TARGETS.forEach((target) => {
     const risk = Number(result.risks[target]);
     const trend = result.trends?.[target];
     const trendText = trend ? ` · ${trend.direction} ${Math.abs(trend.delta * 100).toFixed(1)}%` : "";
@@ -246,14 +311,12 @@ function showModelResult(result) {
     byId(`risk-${target}`).classList.add("loaded");
   });
   byId("recommendation-empty").hidden = true;
-  byId("recommendation-list").innerHTML = result.recommendations
-    .map((recommendation) => `<li>${escapeHTML(recommendation)}</li>`)
-    .join("");
+  byId("recommendation-list").innerHTML = result.recommendations.map((r) => `<li>${escapeHTML(r)}</li>`).join("");
   byId("recommendation-list").hidden = false;
 }
 
 function clearModelResult() {
-  ["hypertension", "nephropathy", "cardiovascular"].forEach((target) => {
+  TARGETS.forEach((target) => {
     const value = byId(`risk-${target}`);
     value.textContent = backendConnected ? "Not run" : "Service offline";
     value.classList.remove("loaded");
@@ -263,7 +326,52 @@ function clearModelResult() {
   byId("recommendation-list").innerHTML = "";
   byId("recommendation-list").hidden = true;
   byId("recommendation-empty").hidden = false;
+  byId("explain-panel").hidden = true;
+  explainResult = null;
 }
+
+/* ---------- explanation (SHAP drivers) ---------- */
+
+async function loadExplanation(values) {
+  byId("explain-panel").hidden = false;
+  byId("explain-tabs").innerHTML = "";
+  byId("explain-bars").innerHTML = "";
+  byId("explain-source").textContent = "";
+  byId("explain-narrative").textContent = "Computing drivers…";
+  try {
+    explainResult = await apiRequest("/explain", { method: "POST", body: JSON.stringify({ values }) });
+    renderExplanation();
+  } catch (error) {
+    explainResult = null;
+    byId("explain-narrative").textContent = `Explanation unavailable: ${error.message}`;
+  }
+}
+
+function renderExplanation() {
+  if (!explainResult) return;
+  byId("explain-tabs").innerHTML = TARGETS.map((t) =>
+    `<button type="button" class="chip${t === explainTarget ? " active" : ""}" data-target="${t}">${t}</button>`).join("");
+  const factors = explainResult.factors[explainTarget] || [];
+  const max = Math.max(...factors.map((f) => Math.abs(f.shap)), 1e-9);
+  byId("explain-bars").innerHTML = factors.map((f) => `<div class="bar-row">
+    <span>${escapeHTML(f.label)}${f.entered ? "" : " <em>(typical value assumed)</em>"}</span>
+    <span class="bar-track"><i class="${f.shap > 0 ? "up" : "down"}" style="width:${(Math.abs(f.shap) / max) * 100}%"></i></span>
+    <span class="bar-val">${f.shap > 0 ? "+" : ""}${f.shap.toFixed(2)}</span>
+  </div>`).join("");
+  byId("explain-narrative").textContent = explainResult.narrative[explainTarget] || "";
+  const source = explainResult.narrativeSource[explainTarget];
+  byId("explain-source").textContent = source === "llm"
+    ? "Narrative written by an LLM from the SHAP values above only."
+    : source === "template" ? "Template summary of the SHAP values above." : "";
+}
+
+byId("explain-tabs").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-target]");
+  if (button && explainResult) {
+    explainTarget = button.dataset.target;
+    renderExplanation();
+  }
+});
 
 byId("assessment-form").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -280,14 +388,8 @@ byId("assessment-form").addEventListener("submit", async (event) => {
 
   const visit = readVisit();
   const values = {
-    RIDAGEYR: visit.age,
-    LBXGH: visit.hba1c,
-    LBXGLU: visit.glucose,
-    BMXBMI: visit.bmi,
-    BPXOSY1: visit.systolic,
-    BPXODI1: visit.diastolic,
-    LBDLDL: visit.ldl,
-    LBDHDD: visit.hdl,
+    RIDAGEYR: visit.age, LBXGH: visit.hba1c, LBXGLU: visit.glucose, BMXBMI: visit.bmi,
+    BPXOSY1: visit.systolic, BPXODI1: visit.diastolic, LBDLDL: visit.ldl, LBDHDD: visit.hdl,
   };
   const reviewButton = form.querySelector("button[type='submit']");
   clearModelResult();
@@ -310,9 +412,10 @@ byId("assessment-form").addEventListener("submit", async (event) => {
     byId("save-visit-button").disabled = false;
     byId("save-visit-button").textContent = visit.patientId ? "Save visit to patient record" : "Add to temporary history";
     byId("save-visit-note").textContent = visit.patientId
-      ? "Patient measurements will be saved in the local SQLite database. The visit note is not persisted."
+      ? "Measurements and the model's risk snapshot will be saved in the local SQLite database. The visit note is not persisted."
       : "Enter a patient ID to save to SQLite; without one, this visit stays in browser memory only.";
     feedback.textContent = `Estimate returned by ${result.modelName}. This is research decision support, not a diagnosis.`;
+    loadExplanation(values); // non-blocking: risks show immediately, drivers follow
   } catch (error) {
     pendingVisit = null;
     clearModelResult();
@@ -330,25 +433,27 @@ byId("assessment-form").addEventListener("submit", async (event) => {
 
 byId("save-visit-button").addEventListener("click", async () => {
   if (!pendingVisit) return;
-  const savedVisit = { ...pendingVisit };
-  if (savedVisit.patientId) {
+  const saved = { ...pendingVisit };
+  if (saved.patientId) {
     try {
       await apiRequest("/visits", {
         method: "POST",
-        body: JSON.stringify({ patientId: savedVisit.patientId, values: savedVisit.values }),
+        body: JSON.stringify({ patientId: saved.patientId, values: saved.values }),
       });
       await loadVisitsFromBackend();
-      byId("form-feedback").textContent = `Visit saved to the local patient record for ${savedVisit.patientId}.`;
-      showToast("Visit measurements saved to the local SQLite database.");
+      byId("form-feedback").textContent = `Visit saved to the local patient record for ${saved.patientId}.`;
+      showToast("Visit and risk snapshot saved to the local SQLite database.");
     } catch (error) {
       byId("form-feedback").textContent = `Visit was not saved: ${error.message}`;
       return;
     }
   } else {
-    visits.unshift(savedVisit);
+    tempVisits.unshift({
+      patientId: "", date: saved.date, hba1c: saved.hba1c, glucose: saved.glucose, bmi: saved.bmi,
+      systolic: saved.systolic, diastolic: saved.diastolic, risks: saved.result.risks,
+    });
     updateVisitCounts();
     renderHistory();
-    drawTrajectory();
     byId("form-feedback").textContent = "Visit added to temporary browser history only.";
     showToast("No patient ID provided; visit remains in browser memory only.");
   }
@@ -357,53 +462,120 @@ byId("save-visit-button").addEventListener("click", async () => {
 });
 
 function updateVisitCounts() {
-  byId("visit-count").textContent = String(visits.length);
-  byId("history-total").textContent = String(visits.length);
+  const total = allVisits().length;
+  byId("visit-count").textContent = String(total);
+  byId("history-total").textContent = String(total);
 }
 
-function formatDate(date) {
-  return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", year: "numeric" }).format(date);
+/* ---------- history ---------- */
+
+function renderHistory() {
+  const query = byId("history-search").value.trim().toLowerCase();
+  const list = allVisits();
+  const filtered = list.filter((v) => (v.patientId || "unidentified patient").toLowerCase().includes(query));
+  const rows = byId("history-rows");
+  byId("history-empty").hidden = list.length > 0;
+  if (list.length > 0 && filtered.length === 0) {
+    rows.innerHTML = '<tr><td colspan="7">No saved visits match this search.</td></tr>';
+    return;
+  }
+  const counts = {};
+  list.forEach((v) => { counts[v.patientId] = (counts[v.patientId] || 0) + 1; });
+  rows.innerHTML = filtered.map((v) => {
+    const pressure = v.systolic === null || v.diastolic === null ? "—" : `${v.systolic}/${v.diastolic}`;
+    const patientCell = v.patientId
+      ? `<button type="button" class="text-button" data-open-patient="${escapeHTML(v.patientId)}">${escapeHTML(v.patientId)}</button> <small>${counts[v.patientId]} visit${counts[v.patientId] === 1 ? "" : "s"}</small>`
+      : "Unidentified";
+    const riskCell = v.risks
+      ? `H ${Math.round(v.risks.hypertension * 100)}% · N ${Math.round(v.risks.nephropathy * 100)}% · C ${Math.round(v.risks.cardiovascular * 100)}%`
+      : "—";
+    return `<tr>
+      <td>${patientCell}</td>
+      <td>${formatDate(v.date)}</td>
+      <td>${v.hba1c === null ? "—" : `${v.hba1c.toFixed(1)}%`}</td>
+      <td>${v.glucose === null ? "—" : `${v.glucose} mg/dL`}</td>
+      <td>${v.bmi === null ? "—" : v.bmi.toFixed(1)}</td>
+      <td>${pressure}</td>
+      <td>${riskCell}</td>
+    </tr>`;
+  }).join("");
 }
+
+byId("history-search").addEventListener("input", renderHistory);
+byId("history-rows").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-open-patient]");
+  if (!button) return;
+  navigate("trajectory");
+  byId("trajectory-patient").value = `patient:${button.dataset.openPatient}`;
+  resetForecast();
+  drawTrajectory();
+});
+
+/* ---------- progression forecast ---------- */
+
+const illustrativeReadings = [
+  { label: "#1", glucose: 126 }, { label: "#2", glucose: 139 }, { label: "#3", glucose: 132 },
+  { label: "#4", glucose: 158 }, { label: "#5", glucose: 149 }, { label: "#6", glucose: 171 },
+];
 
 function selectedPatientReadings() {
   const selected = byId("trajectory-patient").value;
   if (!selected.startsWith("patient:")) return [];
   const patientId = selected.slice("patient:".length);
-  return visits.filter((visit) => visit.patientId === patientId && visit.glucose !== null)
+  return visits
+    .filter((v) => v.patientId === patientId && v.glucose !== null)
     .slice()
-    .sort((left, right) => left.date - right.date)
-    .map((visit, index) => ({ label: `Visit ${index + 1}`, glucose: visit.glucose }));
+    .sort((a, b) => a.date - b.date)
+    .map((v, i) => ({ label: `#${i + 1}`, glucose: v.glucose }));
+}
+
+function selectedReadings() {
+  const selected = byId("trajectory-patient").value;
+  if (selected.startsWith("case:")) {
+    const c = mimicCases.find((x) => `case:${x.id}` === selected);
+    return c ? c.readings.map((g, i) => ({ label: `#${i + 1}`, glucose: g })) : [];
+  }
+  return selectedPatientReadings();
+}
+
+function resetForecast() {
+  forecastState = null;
+  byId("forecast-result").hidden = true;
 }
 
 function updateForecastControls() {
-  const selectedPatient = byId("trajectory-patient").value.startsWith("patient:");
-  const enoughReadings = selectedPatientReadings().length >= 4;
-  const canForecast = backendConnected && forecastAvailable && selectedPatient && enoughReadings;
-  byId("forecast-button").disabled = !canForecast;
-  if (!backendConnected) byId("forecast-status").textContent = "Service offline";
-  else if (!forecastAvailable) byId("forecast-status").textContent = "Artifact unavailable";
-  else if (!selectedPatient) byId("forecast-status").textContent = "Select tracked patient";
-  else if (!enoughReadings) byId("forecast-status").textContent = "Need 4 readings";
-  else byId("forecast-status").textContent = byId("forecast-result").hidden ? "Ready to run" : "Forecast ready";
+  const selected = byId("trajectory-patient").value;
+  const real = selected !== "illustrative";
+  const enough = selectedReadings().length >= 4;
+  byId("forecast-button").disabled = !(backendConnected && forecastAvailable && real && enough);
+  const status = byId("forecast-status");
+  if (!backendConnected) status.textContent = "Service offline";
+  else if (!forecastAvailable) status.textContent = "Artifact unavailable";
+  else if (!real) status.textContent = "Select a case or patient";
+  else if (!enough) status.textContent = "Need 4 readings";
+  else status.textContent = byId("forecast-result").hidden ? "Ready to run" : "Forecast ready";
 }
 
 byId("forecast-button").addEventListener("click", async () => {
-  const readings = selectedPatientReadings().map((reading) => reading.glucose);
   if (byId("forecast-button").disabled) return;
-  const button = byId("forecast-button");
+  const readings = selectedReadings().map((r) => r.glucose);
   const resultPanel = byId("forecast-result");
-  button.disabled = true;
+  byId("forecast-button").disabled = true;
   byId("forecast-status").textContent = "Forecasting…";
   resultPanel.hidden = true;
   try {
-    const result = await apiRequest("/forecast", {
-      method: "POST",
-      body: JSON.stringify({ readings }),
-    });
+    const result = await apiRequest("/forecast", { method: "POST", body: JSON.stringify({ readings }) });
     const change = result.forecast - result.lastObserved;
-    resultPanel.innerHTML = `<span>Forecasted next glucose reading</span><strong>${Number(result.forecast).toFixed(0)} mg/dL</strong><small>${change >= 0 ? "+" : ""}${change.toFixed(0)} mg/dL vs last reading · ${result.readingsUsed} recent readings</small>`;
+    const errText = result.expectedError ? ` · typical error ±${Number(result.expectedError).toFixed(0)} mg/dL` : "";
+    resultPanel.innerHTML = `<span>Forecasted next glucose reading</span><strong>${Number(result.forecast).toFixed(0)} mg/dL</strong><small>${change >= 0 ? "+" : ""}${change.toFixed(0)} mg/dL vs last reading · ${result.readingsUsed} recent readings${errText}</small>`;
     resultPanel.hidden = false;
+    forecastState = {
+      selection: byId("trajectory-patient").value,
+      value: result.forecast,
+      expectedError: result.expectedError || 0,
+    };
     byId("forecast-status").textContent = "Forecast ready";
+    drawTrajectory();
   } catch (error) {
     resultPanel.textContent = error.message;
     resultPanel.hidden = false;
@@ -413,59 +585,28 @@ byId("forecast-button").addEventListener("click", async () => {
   }
 });
 
-function escapeHTML(text) {
-  return String(text).replace(/[&<>"']/g, (character) => ({
-    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
-  })[character]);
-}
-
-function renderHistory() {
-  const query = byId("history-search").value.trim().toLowerCase();
-  const filtered = visits.filter((visit) => (visit.patientId || "unidentified patient").toLowerCase().includes(query));
-  const rows = byId("history-rows");
-  byId("history-empty").hidden = visits.length > 0;
-  if (visits.length > 0 && filtered.length === 0) {
-    rows.innerHTML = '<tr><td colspan="7">No saved visits match this search.</td></tr>';
-    return;
-  }
-  rows.innerHTML = filtered.map((visit) => {
-    const pressure = visit.systolic === null || visit.diastolic === null ? "—" : `${visit.systolic}/${visit.diastolic}`;
-    return `<tr>
-      <td>${escapeHTML(visit.patientId || "Unidentified")}</td>
-      <td>${formatDate(visit.date)}</td>
-      <td>${visit.hba1c === null ? "—" : `${visit.hba1c.toFixed(1)}%`}</td>
-      <td>${visit.glucose === null ? "—" : `${visit.glucose} mg/dL`}</td>
-      <td>${visit.bmi === null ? "—" : visit.bmi.toFixed(1)}</td>
-      <td>${pressure}</td>
-      <td><span class="table-state">Not attached to visit</span></td>
-    </tr>`;
-  }).join("");
-}
-
-byId("history-search").addEventListener("input", renderHistory);
-
-const illustrativeReadings = [
-  { label: "Visit 1", glucose: 126 },
-  { label: "Visit 2", glucose: 139 },
-  { label: "Visit 3", glucose: 132 },
-  { label: "Visit 4", glucose: 158 },
-  { label: "Visit 5", glucose: 149 },
-  { label: "Visit 6", glucose: 171 },
-];
-
 function drawTrajectory() {
   const canvas = byId("glucose-chart");
   const context = canvas.getContext("2d");
   const selected = byId("trajectory-patient").value;
-  const usePatient = selected.startsWith("patient:");
-  const readings = usePatient ? selectedPatientReadings() : illustrativeReadings;
+  const isCase = selected.startsWith("case:");
+  const isPatient = selected.startsWith("patient:");
+  const readings = isCase || isPatient ? selectedReadings() : illustrativeReadings;
+
   byId("reading-count").textContent = String(readings.length);
   byId("chart-empty").hidden = readings.length > 0;
   canvas.hidden = readings.length === 0;
-  byId("chart-caption").textContent = usePatient
-    ? `${selected.slice("patient:".length)} · saved patient glucose measurements`
-    : "Illustrative values only · synthetic, not patient data";
-  byId("chart-empty").textContent = "No saved glucose measurements for this patient.";
+
+  if (isCase) {
+    const c = mimicCases.find((x) => `case:${x.id}` === selected);
+    byId("chart-caption").textContent = c
+      ? `${c.label} · ICU point-of-care glucose (de-identified) · showing last ${readings.length} of ${c.totalReadings}`
+      : "MIMIC-IV demo case";
+  } else if (isPatient) {
+    byId("chart-caption").textContent = `${selected.slice("patient:".length)} · saved patient glucose measurements`;
+  } else {
+    byId("chart-caption").textContent = "Illustrative values only · synthetic, not patient data";
+  }
   updateForecastControls();
   if (!readings.length) return;
 
@@ -480,16 +621,23 @@ function drawTrajectory() {
   const pad = { top: 16, right: 16, bottom: 32, left: 43 };
   const chartWidth = width - pad.left - pad.right;
   const chartHeight = height - pad.top - pad.bottom;
-  const minValue = 50;
-  const maxValue = 250;
-  const xAt = (index) => pad.left + (readings.length === 1 ? chartWidth / 2 : index * chartWidth / (readings.length - 1));
-  const yAt = (value) => pad.top + (maxValue - value) * chartHeight / (maxValue - minValue);
+
+  const fc = forecastState && forecastState.selection === selected ? forecastState : null;
+  const err = fc ? fc.expectedError : 0;
+  const vals = readings.map((r) => r.glucose);
+  if (fc) vals.push(fc.value + err, Math.max(fc.value - err, 0));
+  const minValue = Math.max(0, Math.floor((Math.min(...vals, 100) - 10) / 50) * 50);
+  const maxValue = Math.ceil((Math.max(...vals, 180) + 10) / 50) * 50;
+  const step = maxValue - minValue > 300 ? 100 : 50;
+  const n = readings.length + (fc ? 1 : 0);
+  const xAt = (i) => pad.left + (n === 1 ? chartWidth / 2 : (i * chartWidth) / (n - 1));
+  const yAt = (v) => pad.top + ((maxValue - v) * chartHeight) / (maxValue - minValue);
 
   context.clearRect(0, 0, width, height);
   context.font = '10px "DM Sans", sans-serif';
   context.textAlign = "right";
   context.textBaseline = "middle";
-  [50, 100, 150, 200, 250].forEach((tick) => {
+  for (let tick = minValue; tick <= maxValue; tick += step) {
     const y = yAt(tick);
     context.beginPath();
     context.strokeStyle = "#e9efec";
@@ -499,22 +647,24 @@ function drawTrajectory() {
     context.stroke();
     context.fillStyle = "#98a59f";
     context.fillText(String(tick), pad.left - 9, y);
-  });
+  }
 
-  context.save();
-  context.setLineDash([4, 4]);
-  context.strokeStyle = "#e4b9a9";
-  context.beginPath();
-  context.moveTo(pad.left, yAt(140));
-  context.lineTo(width - pad.right, yAt(140));
-  context.stroke();
-  context.restore();
+  if (140 >= minValue && 140 <= maxValue) {
+    context.save();
+    context.setLineDash([4, 4]);
+    context.strokeStyle = "#e4b9a9";
+    context.beginPath();
+    context.moveTo(pad.left, yAt(140));
+    context.lineTo(width - pad.right, yAt(140));
+    context.stroke();
+    context.restore();
+  }
 
   context.beginPath();
-  readings.forEach((reading, index) => {
-    const x = xAt(index);
-    const y = yAt(reading.glucose);
-    if (index === 0) context.moveTo(x, y);
+  readings.forEach((r, i) => {
+    const x = xAt(i);
+    const y = yAt(r.glucose);
+    if (i === 0) context.moveTo(x, y);
     else context.lineTo(x, y);
   });
   context.strokeStyle = "#178775";
@@ -523,32 +673,70 @@ function drawTrajectory() {
   context.lineCap = "round";
   context.stroke();
 
-  readings.forEach((reading, index) => {
-    const x = xAt(index);
-    const y = yAt(reading.glucose);
+  const dense = readings.length > 12;
+  readings.forEach((r, i) => {
+    const x = xAt(i);
+    const y = yAt(r.glucose);
     context.beginPath();
-    context.arc(x, y, 4, 0, Math.PI * 2);
+    context.arc(x, y, dense ? 2.5 : 4, 0, Math.PI * 2);
     context.fillStyle = "#fff";
     context.fill();
     context.strokeStyle = "#178775";
     context.lineWidth = 2;
     context.stroke();
-    context.fillStyle = "#83918b";
+    if (!dense || i % 5 === 0) {
+      context.fillStyle = "#83918b";
+      context.font = '9px "DM Sans", sans-serif';
+      context.textAlign = "center";
+      context.textBaseline = "top";
+      context.fillText(r.label, x, height - 20);
+    }
+  });
+
+  if (fc) {
+    const last = readings.length - 1;
+    const x = xAt(readings.length);
+    const y = yAt(fc.value);
+    context.save();
+    context.strokeStyle = "#d7785c";
+    context.lineWidth = 2;
+    context.setLineDash([5, 4]);
+    context.beginPath();
+    context.moveTo(xAt(last), yAt(readings[last].glucose));
+    context.lineTo(x, y);
+    context.stroke();
+    if (err) {
+      context.setLineDash([]);
+      context.beginPath();
+      context.moveTo(x, yAt(fc.value + err));
+      context.lineTo(x, yAt(Math.max(fc.value - err, 0)));
+      context.stroke();
+    }
+    context.restore();
+    context.beginPath();
+    context.arc(x, y, 5, 0, Math.PI * 2);
+    context.fillStyle = "#d7785c";
+    context.fill();
+    context.fillStyle = "#a45e47";
     context.font = '9px "DM Sans", sans-serif';
     context.textAlign = "center";
     context.textBaseline = "top";
-    context.fillText(reading.label, x, height - 20);
-  });
+    context.fillText("Forecast", x, height - 20);
+  }
 }
 
-byId("trajectory-patient").addEventListener("change", drawTrajectory);
+byId("trajectory-patient").addEventListener("change", () => {
+  resetForecast();
+  drawTrajectory();
+});
 window.addEventListener("resize", () => {
   if (byId("view-trajectory").classList.contains("active")) drawTrajectory();
 });
 
+/* ---------- init ---------- */
+
 updateVisitCounts();
 renderHistory();
-window.requestAnimationFrame(drawTrajectory);
 
 function initializeApp() {
   const username = sessionStorage.getItem(DEMO_SESSION_KEY);
