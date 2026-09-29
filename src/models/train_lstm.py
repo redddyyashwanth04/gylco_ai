@@ -7,8 +7,7 @@ happens.
 Run: python src/models/train_lstm.py
 
 What it does, in order:
-  1. Build the same real+augmented glucose windows as train_track_b.py
-     (30 real patients, 370 real windows, 1,850 with augmentation).
+  1. Build the same real+augmented glucose windows as train_track_b.py.
   2. Train a small LSTM: last 4 readings in, 5th reading predicted.
   3. Test with leave-one-patient-out -- test only on real data, and never
      split one patient's windows across train and test.
@@ -24,7 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from config import MIMIC_TRAJECTORIES, MODELS_SAVED
-from src.features.augmentation import jitter, window_slice
+from src.features.augmentation import jitter, window_slice, time_warp
 from src.storage.db import init_db, register_model_version, promote_model
 
 import numpy as np
@@ -34,9 +33,10 @@ import torch.nn as nn
 from sklearn.model_selection import LeaveOneGroupOut
 from sklearn.preprocessing import StandardScaler
 
-WINDOW = 5      # same as train_track_b.py -- 4 readings in, 1 predicted
-STRIDE = 3
+WINDOW = 5      # 4 readings in, 1 predicted
+STRIDE = 1      # small stride = more overlapping windows from the same real data
 JITTER_COPIES = 4
+TIME_WARP_COPIES = 2
 HIDDEN_SIZE = 16   # deliberately small -- this is a ~30-patient dataset, a big
                    # LSTM will just memorize it. Do not raise this without a
                    # reason.
@@ -68,6 +68,11 @@ def build_windows(traj_df):
             sequences.append(win[:-1]); targets.append(win[-1]); groups.append(pid); aug.append(False)
             for copy in jitter(win, n_copies=JITTER_COPIES, seed=1):
                 sequences.append(copy[:-1]); targets.append(copy[-1]); groups.append(pid); aug.append(True)
+            idx = list(range(len(win)))
+            for _ in range(TIME_WARP_COPIES):
+                warped_idx = time_warp(idx, warp_std_frac=0.15, seed=None)
+                warped_vals = [win[min(max(int(round(i)), 0), len(win)-1)] for i in warped_idx]
+                sequences.append(warped_vals[:-1]); targets.append(warped_vals[-1]); groups.append(pid); aug.append(True)
     return np.array(sequences), np.array(targets), np.array(groups), np.array(aug)
 
 
