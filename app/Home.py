@@ -42,7 +42,7 @@ Use the sidebar to navigate between pages.
 st.subheader("Current model status")
 
 # Show the models actually trained and registered in this project.
-for model_name in ["nhanes_active", "mimic_glucose_forecaster_lstm"]:
+for model_name in ["nhanes_active", "mimic_glucose_forecaster"]:
     active = get_active_model_version(model_name)
     if active is None:
         st.info(f"**{model_name}**: no trained version registered yet.")

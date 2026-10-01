@@ -8,7 +8,7 @@ const pageNames = {
   models: "Model transparency",
 };
 const TARGETS = ["hypertension", "nephropathy", "cardiovascular"];
-const API_BASE = `${window.location.protocol}//${window.location.hostname}:5001/api`;
+const API_BASE = `/api`;
 const DEMO_SESSION_KEY = "carepath_demo_user";
 
 const visits = [];        // saved visits from the local database
@@ -60,10 +60,10 @@ function formatDate(date) {
 }
 
 function metricText(model) {
-  if (model.model_name.startsWith("mimic")) {
-    const match = /mean abs error ([\d.]+)/.exec(model.notes || "");
-    return match ? `MAE ${match[1]} mg/dL` : "Not recorded";
-  }
+  // Track B: both LSTM and Ridge notes contain "mean abs error N"
+  const maeMatch = /mean abs error ([\d.]+)/.exec(model.notes || "");
+  if (maeMatch) return `MAE ${maeMatch[1]} mg/dL`;
+  // Track A: AUC stored as a numeric column
   return model.val_auc ? `AUC ${Number(model.val_auc).toFixed(3)}` : "Not recorded";
 }
 
@@ -135,7 +135,8 @@ function updateTrajectoryOptions() {
 async function loadModelsFromBackend(health) {
   const { models } = await apiRequest("/models");
   const current = models.find((m) => m.model_name === "nhanes_active" && m.is_active);
-  const trajectory = models.find((m) => m.model_name === "mimic_glucose_forecaster" && m.is_active);
+  const trajectory = models.find((m) => m.model_name === "mimic_glucose_forecaster_lstm" && m.is_active)
+    || models.find((m) => m.model_name === "mimic_glucose_forecaster" && m.is_active);
 
   byId("registry-status").textContent = models.length
     ? `${models.length} registered model version${models.length === 1 ? "" : "s"}`
@@ -146,9 +147,9 @@ async function loadModelsFromBackend(health) {
   byId("track-a-status").classList.toggle("unavailable", !current);
   byId("track-a-version").textContent = current ? `Version ${current.version_id}` : health.modelName;
   byId("track-a-validation").textContent = current ? metricText(current) : "Not recorded";
-  byId("track-b-status").textContent = health.forecastAvailable ? "Artifact available" : "Artifact unavailable";
+  byId("track-b-status").textContent = trajectory ? "Active" : (health.forecastAvailable ? "Artifact available" : "Artifact unavailable");
   byId("track-b-status").classList.toggle("unavailable", !health.forecastAvailable);
-  byId("track-b-version").textContent = trajectory ? `Version ${trajectory.version_id}` : "No active registry version";
+  byId("track-b-version").textContent = trajectory ? `Version ${trajectory.version_id}` : (health.forecastModel || "No active registry version");
   byId("track-b-validation").textContent = trajectory ? metricText(trajectory) : "Not recorded";
 
   byId("registry-rows").innerHTML = models.map((m) => `<tr>
@@ -164,10 +165,11 @@ async function loadModelsFromBackend(health) {
 
 function fillOverview(health, models, info) {
   const a = models.find((m) => m.model_name === "nhanes_active" && m.is_active);
-  const b = models.find((m) => m.model_name === "mimic_glucose_forecaster" && m.is_active);
+  const b = models.find((m) => m.model_name === "mimic_glucose_forecaster_lstm" && m.is_active)
+    || models.find((m) => m.model_name === "mimic_glucose_forecaster" && m.is_active);
   byId("ov-a-model").textContent = health.modelName.replace(/^nhanes_/, "").replace(/_/g, " ");
   byId("ov-a-detail").textContent = a ? `Registry v${a.version_id} · ${metricText(a)}` : "Not in registry";
-  byId("ov-b-model").textContent = health.forecastAvailable ? "Ridge forecaster" : "Unavailable";
+  byId("ov-b-model").textContent = health.forecastAvailable ? (health.forecastModel || "Ridge forecaster") : "Unavailable";
   byId("ov-b-detail").textContent = b ? `Registry v${b.version_id} · ${metricText(b)}` : "No active registry version";
   byId("ov-patients").textContent = info ? String(info.patients.length) : "—";
   byId("ov-predictions").textContent = info ? String(info.predictionCount) : "—";
@@ -254,8 +256,15 @@ byId("example-button").addEventListener("click", () => {
   const example = {
     "patient-id": "DEMO-1042", age: "58", hba1c: "7.4", glucose: "150", bmi: "31.0",
     systolic: "142", diastolic: "88", ldl: "130", hdl: "42",
+    sedentary: "9", income: "1.8",
   };
-  Object.entries(example).forEach(([id, value]) => { byId(id).value = value; });
+  Object.entries(example).forEach(([id, value]) => {
+    const el = byId(id);
+    if (el) el.value = value;
+  });
+  // dropdowns
+  byId("sex").value = "1";        // Male
+  byId("smoking").value = "2";    // Former smoker
   pendingVisit = null;
   clearModelResult();
   byId("model-empty-title").textContent = "Ready for assessment";
@@ -269,6 +278,8 @@ byId("example-button").addEventListener("click", () => {
 });
 
 function readVisit() {
+  const sexEl = byId("sex");
+  const smokingEl = byId("smoking");
   return {
     patientId: byId("patient-id").value.trim(),
     age: valueOf("age"),
@@ -279,6 +290,10 @@ function readVisit() {
     diastolic: valueOf("diastolic"),
     ldl: valueOf("ldl"),
     hdl: valueOf("hdl"),
+    sex: sexEl && sexEl.value ? Number(sexEl.value) : null,
+    smoking: smokingEl && smokingEl.value ? Number(smokingEl.value) : null,
+    sedentary: valueOf("sedentary"),
+    income: valueOf("income"),
     note: byId("visit-note").value.trim(),
     date: new Date(),
   };
@@ -390,6 +405,10 @@ byId("assessment-form").addEventListener("submit", async (event) => {
   const values = {
     RIDAGEYR: visit.age, LBXGH: visit.hba1c, LBXGLU: visit.glucose, BMXBMI: visit.bmi,
     BPXOSY1: visit.systolic, BPXODI1: visit.diastolic, LBDLDL: visit.ldl, LBDHDD: visit.hdl,
+    RIAGENDR: visit.sex,           // 1=Male 2=Female (NHANES code)
+    SMQ020: visit.smoking,         // 1=current 2=former 3=never (NHANES SMQ020)
+    PAD680: visit.sedentary,       // sedentary mins/day → hours sent as-is; backend scales if needed
+    INDFMPIR: visit.income,        // income-to-poverty ratio (NHANES INDFMPIR)
   };
   const reviewButton = form.querySelector("button[type='submit']");
   clearModelResult();
@@ -412,7 +431,7 @@ byId("assessment-form").addEventListener("submit", async (event) => {
     byId("save-visit-button").disabled = false;
     byId("save-visit-button").textContent = visit.patientId ? "Save visit to patient record" : "Add to temporary history";
     byId("save-visit-note").textContent = visit.patientId
-      ? "Measurements and the model's risk snapshot will be saved in the local SQLite database. The visit note is not persisted."
+      ? "Measurements, risk snapshot, and visit note will be saved in the local SQLite database."
       : "Enter a patient ID to save to SQLite; without one, this visit stays in browser memory only.";
     feedback.textContent = `Estimate returned by ${result.modelName}. This is research decision support, not a diagnosis.`;
     loadExplanation(values); // non-blocking: risks show immediately, drivers follow
@@ -438,7 +457,7 @@ byId("save-visit-button").addEventListener("click", async () => {
     try {
       await apiRequest("/visits", {
         method: "POST",
-        body: JSON.stringify({ patientId: saved.patientId, values: saved.values }),
+        body: JSON.stringify({ patientId: saved.patientId, values: saved.values, note: saved.note }),
       });
       await loadVisitsFromBackend();
       byId("form-feedback").textContent = `Visit saved to the local patient record for ${saved.patientId}.`;
@@ -567,7 +586,8 @@ byId("forecast-button").addEventListener("click", async () => {
     const result = await apiRequest("/forecast", { method: "POST", body: JSON.stringify({ readings }) });
     const change = result.forecast - result.lastObserved;
     const errText = result.expectedError ? ` · typical error ±${Number(result.expectedError).toFixed(0)} mg/dL` : "";
-    resultPanel.innerHTML = `<span>Forecasted next glucose reading</span><strong>${Number(result.forecast).toFixed(0)} mg/dL</strong><small>${change >= 0 ? "+" : ""}${change.toFixed(0)} mg/dL vs last reading · ${result.readingsUsed} recent readings${errText}</small>`;
+    const modelText = result.forecasterName ? ` · ${result.forecasterName}` : "";
+    resultPanel.innerHTML = `<span>Forecasted next glucose reading</span><strong>${Number(result.forecast).toFixed(0)} mg/dL</strong><small>${change >= 0 ? "+" : ""}${change.toFixed(0)} mg/dL vs last reading · ${result.readingsUsed} recent readings${errText}${modelText}</small>`;
     resultPanel.hidden = false;
     forecastState = {
       selection: byId("trajectory-patient").value,

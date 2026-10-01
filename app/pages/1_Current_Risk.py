@@ -61,15 +61,47 @@ with st.form("current_risk_form"):
         ldl = st.number_input("LDL cholesterol (mg/dL)", min_value=30, max_value=300, value=100)
         hdl = st.number_input("HDL cholesterol (mg/dL)", min_value=15, max_value=120, value=50)
 
+    with st.expander("Optional fields (sex, smoking, sedentary time, income)", expanded=False):
+        st.caption("Blank fields use training-set medians. Entering them gives patient-specific SHAP drivers rather than 'typical value assumed'.")
+        opt_col1, opt_col2 = st.columns(2)
+        with opt_col1:
+            sex = st.selectbox("Sex", options=["Not entered", "Male (1)", "Female (2)"], index=0)
+            smoking = st.selectbox(
+                "Smoking status",
+                options=["Not entered", "Current smoker (1)", "Former smoker (2)", "Never smoked (3)"],
+                index=0,
+            )
+        with opt_col2:
+            sedentary = st.number_input(
+                "Sedentary time (hours/day)", min_value=0.0, max_value=24.0,
+                value=0.0, step=0.5, help="Leave at 0 to omit (uses training median)."
+            )
+            income = st.number_input(
+                "Income-to-poverty ratio", min_value=0.0, max_value=5.0,
+                value=0.0, step=0.1, help="NHANES INDFMPIR. Leave at 0 to omit."
+            )
+
     submitted = st.form_submit_button("Calculate risk")
 
 if submitted:
     from src.storage.db import get_active_model_version
 
+    # Map selectbox labels back to NHANES numeric codes (None = omit → median fill)
+    _sex_map = {"Male (1)": 1, "Female (2)": 2}
+    _smoke_map = {"Current smoker (1)": 1, "Former smoker (2)": 2, "Never smoked (3)": 3}
+
     values = {
         "RIDAGEYR": age, "LBXGH": hba1c, "LBXGLU": glucose, "BMXBMI": bmi,
         "BPXOSY1": systolic_bp, "BPXODI1": diastolic_bp, "LBDLDL": ldl, "LBDHDD": hdl,
     }
+    if sex != "Not entered":
+        values["RIAGENDR"] = _sex_map[sex]
+    if smoking != "Not entered":
+        values["SMQ020"] = _smoke_map[smoking]
+    if sedentary > 0:
+        values["PAD680"] = sedentary
+    if income > 0:
+        values["INDFMPIR"] = income
 
     try:
         from src.explainability.explain import explain_patient

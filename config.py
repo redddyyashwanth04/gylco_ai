@@ -15,7 +15,7 @@ DATA_RAW_MIMIC = ROOT / "data" / "raw" / "mimic_demo"
 DATA_PROCESSED = ROOT / "data" / "processed"
 DATA_MODEL_READY = ROOT / "data" / "model_ready"
 
-NHANES_MERGED = DATA_PROCESSED / "nhanes_merged.csv"
+DATA_AUGMENTED = ROOT / "data" / "augmented"
 MIMIC_TRAJECTORIES = DATA_PROCESSED / "mimic_trajectories.csv"
 MIMIC_PATIENT_SUMMARY = DATA_PROCESSED / "mimic_patient_summary.csv"
 

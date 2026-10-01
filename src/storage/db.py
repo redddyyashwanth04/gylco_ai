@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS visits (
     diastolic_bp      REAL,
     risks_json        TEXT,
     model_version_id  INTEGER,
+    note              TEXT,
     FOREIGN KEY (patient_id) REFERENCES patients(patient_id)
 );
 
@@ -85,6 +86,8 @@ def _migrate(conn):
         conn.execute("ALTER TABLE visits ADD COLUMN risks_json TEXT")
     if "model_version_id" not in cols:
         conn.execute("ALTER TABLE visits ADD COLUMN model_version_id INTEGER")
+    if "note" not in cols:
+        conn.execute("ALTER TABLE visits ADD COLUMN note TEXT")
 
 
 def init_db():
@@ -97,8 +100,8 @@ def init_db():
 
 
 def add_visit(patient_id, hba1c=None, glucose=None, bmi=None, systolic_bp=None,
-              diastolic_bp=None, risks=None, model_version_id=None):
-    """Records one check-in. Stores the model's risk snapshot with the visit so trends compare like with like."""
+              diastolic_bp=None, risks=None, model_version_id=None, note=None):
+    """Records one check-in. Stores the model's risk snapshot and optional clinician note."""
     conn = get_connection()
     now = datetime.now().isoformat()
     conn.execute(
@@ -107,10 +110,10 @@ def add_visit(patient_id, hba1c=None, glucose=None, bmi=None, systolic_bp=None,
     )
     conn.execute(
         """INSERT INTO visits (patient_id, visit_date, hba1c, glucose, bmi, systolic_bp,
-                               diastolic_bp, risks_json, model_version_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                               diastolic_bp, risks_json, model_version_id, note)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (patient_id, now, hba1c, glucose, bmi, systolic_bp, diastolic_bp,
-         json.dumps(risks) if risks else None, model_version_id),
+         json.dumps(risks) if risks else None, model_version_id, note or None),
     )
     conn.commit()
     conn.close()

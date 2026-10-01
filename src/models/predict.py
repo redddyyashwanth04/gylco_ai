@@ -18,12 +18,25 @@ import pandas as pd
 TARGETS = ["hypertension", "nephropathy", "cardiovascular"]
 
 
+_MODEL_CACHE: dict = {}   # {name, model, feature_cols, mtime}
+
+
 def load_active_model():
-    name = (MODELS_SAVED / "nhanes_active_name.txt").read_text().strip()
-    with open(MODELS_SAVED / f"{name}.pkl", "rb") as f:
+    """Load the active Track A model. Reloads automatically if the artifact changes on disk."""
+    name_path = MODELS_SAVED / "nhanes_active_name.txt"
+    name = name_path.read_text().strip()
+    pkl_path = MODELS_SAVED / f"{name}.pkl"
+    mtime = pkl_path.stat().st_mtime
+
+    if _MODEL_CACHE.get("name") == name and _MODEL_CACHE.get("mtime") == mtime:
+        return _MODEL_CACHE["name"], _MODEL_CACHE["model"], _MODEL_CACHE["feature_cols"]
+
+    with open(pkl_path, "rb") as f:
         model = pickle.load(f)
     with open(MODELS_SAVED / "nhanes_feature_columns.pkl", "rb") as f:
         feature_cols = pickle.load(f)
+
+    _MODEL_CACHE.update(name=name, model=model, feature_cols=feature_cols, mtime=mtime)
     return name, model, feature_cols
 
 

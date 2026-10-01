@@ -19,10 +19,9 @@
         <span><strong>carepath</strong><small>CLINICIAN WORKSPACE</small></span>
       </a>
 
-      <div class="clinic-switcher">
+      <div class="clinic-label">
         <span class="clinic-icon" aria-hidden="true">N</span>
         <span><strong>Northside Clinic</strong><small>Endocrinology</small></span>
-        <span class="chevron" aria-hidden="true">⌄</span>
       </div>
 
       <p class="nav-label">WORKSPACE</p>
@@ -89,17 +88,6 @@
               <p class="muted-copy">Outputs are estimates and points for review. The clinician makes every decision.</p>
             </div>
           </section>
-          <aside class="review-column">
-            <section class="panel review-panel">
-              <div class="review-heading"><div><p class="eyebrow">HONEST LIMITS</p><h2>What this is not</h2></div></div>
-              <ul class="recommendation-list">
-                <li>A research prototype, not a validated or approved medical device.</li>
-                <li>Track A is trained on NHANES survey data; labels are largely self-reported.</li>
-                <li>Track B is trained on 35 ICU patients (MIMIC-IV Demo), augmented. It is a proof of concept, and outpatient use is out of distribution.</li>
-                <li>Model retraining from app data is designed but not yet enabled.</li>
-              </ul>
-            </section>
-          </aside>
         </div>
       </section>
 
@@ -154,12 +142,36 @@
               </div>
             </div>
 
-            <div class="form-section last-section">
+            <div class="form-section">
               <div class="section-title-row"><h3>Lipid panel</h3><span class="section-accent gold"></span></div>
               <div class="field-grid two-col">
                 <label class="field"><span>LDL cholesterol</span><div class="input-unit"><input id="ldl" name="ldl" type="number" min="30" max="300" value="130"><span>mg/dL</span></div></label>
                 <label class="field"><span>HDL cholesterol</span><div class="input-unit"><input id="hdl" name="hdl" type="number" min="15" max="120" value="42"><span>mg/dL</span></div></label>
               </div>
+            </div>
+
+            <div class="form-section last-section">
+              <div class="section-title-row"><h3>Lifestyle &amp; demographics <em>Optional — improves SHAP accuracy</em></h3><span class="section-accent"></span></div>
+              <div class="field-grid two-col">
+                <label class="field"><span>Sex</span>
+                  <select id="sex" name="sex">
+                    <option value="">Not entered</option>
+                    <option value="1">Male</option>
+                    <option value="2">Female</option>
+                  </select>
+                </label>
+                <label class="field"><span>Smoking status</span>
+                  <select id="smoking" name="smoking">
+                    <option value="">Not entered</option>
+                    <option value="1">Current smoker</option>
+                    <option value="2">Former smoker</option>
+                    <option value="3">Never smoked</option>
+                  </select>
+                </label>
+                <label class="field"><span>Sedentary time <em>hrs/day</em></span><div class="input-unit"><input id="sedentary" name="sedentary" type="number" min="0" max="24" step="0.5" placeholder="e.g. 8"><span>h</span></div></label>
+                <label class="field"><span>Income-to-poverty ratio</span><div class="input-unit"><input id="income" name="income" type="number" min="0" max="5" step="0.1" placeholder="e.g. 2.5"><span>×FPL</span></div></label>
+              </div>
+              <p class="tiny-note">Blank optional fields use training-set medians — the SHAP chart will label them <em>"typical value assumed"</em>. Entering them gives patient-specific drivers.</p>
             </div>
 
             <div class="form-footer">
@@ -202,7 +214,7 @@
               <div class="panel-heading compact"><div><p class="eyebrow">FOR YOUR REVIEW</p><h2>Points for clinician review</h2></div><span class="plan-icon">＋</span></div>
               <p class="muted-copy" id="recommendation-empty">Points for review will appear after a successful assessment.</p>
               <ul class="recommendation-list" id="recommendation-list" hidden></ul>
-              <label class="field note-field"><span>Visit note <em>Session only</em></span><textarea id="visit-note" rows="3" placeholder="Add a note for this temporary preview…"></textarea></label>
+              <label class="field note-field"><span>Visit note <em>Saved with visit</em></span><textarea id="visit-note" rows="3" placeholder="Add a clinical note for this visit…"></textarea></label>
               <button class="secondary-button" type="button" id="save-visit-button" disabled>Save visit</button>
               <p class="tiny-note" id="save-visit-note">A patient ID is required to save this encounter to the local patient database.</p>
             </section>
@@ -228,7 +240,7 @@
           <div class="chart-foot"><span>Dashed line: 140 mg/dL reference. Orange point: forecast, with typical error bar.</span><span>mg/dL</span></div>
         </div>
         <div class="forecast-result" id="forecast-result" hidden></div>
-        <div class="connection-note" id="forecast-note"><span class="banner-symbol">i</span><p><strong>Forecast is model-generated.</strong> The forecaster was trained on ICU point-of-care glucose (MIMIC-IV Demo, 35 patients); applying it to outpatient fasting glucose is out-of-distribution. The error bar is the typical error from leave-one-patient-out testing. At least four glucose readings are needed.</p></div>
+        <div class="connection-note" id="forecast-note"><span class="banner-symbol">i</span><p><strong>Forecast is model-generated.</strong> The LSTM v2 ensemble (Track B) was trained on ICU point-of-care glucose from MIMIC-IV Demo (30 patients); applying it to outpatient fasting glucose is out-of-distribution. The error bar is the typical leave-one-patient-out MAE. At least four glucose readings are needed. If the LSTM artifact is unavailable the Ridge forecaster is used as fallback.</p></div>
       </section>
 
       <!-- PATIENT HISTORY -->
@@ -247,7 +259,7 @@
         <div class="model-overview"><div><span class="overview-label">LIVE REGISTRY</span><strong id="registry-status">Loading registry…</strong><small id="registry-detail">Reading registered versions from the local SQLite database</small></div><span class="registry-mark">◎</span></div>
         <div class="model-list">
           <article class="panel model-card"><div class="model-card-top"><span class="model-symbol teal">A</span><span class="status-chip unavailable" id="track-a-status">Checking</span></div><p class="eyebrow">TRACK A · CURRENT RISK</p><h2>NHANES complication model</h2><p>Multi-label estimates for hypertension, nephropathy, and cardiovascular outcomes, based on current patient values.</p><div class="model-meta"><span>Source <strong>NHANES</strong></span><span>Validation <strong id="track-a-validation">Unavailable</strong></span><span>Active version <strong id="track-a-version">Checking</strong></span></div></article>
-          <article class="panel model-card"><div class="model-card-top"><span class="model-symbol coral">B</span><span class="status-chip unavailable" id="track-b-status">Checking</span></div><p class="eyebrow">TRACK B · GLUCOSE TRAJECTORY</p><h2>MIMIC-IV glucose forecaster</h2><p>Forecasts the next glucose reading from the previous four. Error is leave-one-patient-out mean absolute error.</p><div class="model-meta"><span>Source <strong>MIMIC-IV Demo</strong></span><span>Validation <strong id="track-b-validation">Unavailable</strong></span><span>Active version <strong id="track-b-version">Checking</strong></span></div></article>
+          <article class="panel model-card"><div class="model-card-top"><span class="model-symbol coral">B</span><span class="status-chip unavailable" id="track-b-status">Checking</span></div><p class="eyebrow">TRACK B · GLUCOSE TRAJECTORY</p><h2>MIMIC-IV LSTM v2 forecaster</h2><p>Forecasts the next glucose reading from the previous four. LSTM v2 residual ensemble (3 seeds). Ridge fallback if .pt artifact missing. Error is leave-one-patient-out MAE.</p><div class="model-meta"><span>Source <strong>MIMIC-IV Demo</strong></span><span>Validation <strong id="track-b-validation">Unavailable</strong></span><span>Active version <strong id="track-b-version">Checking</strong></span></div></article>
         </div>
         <div class="panel table-panel registry-table">
           <div class="table-scroll"><table><thead><tr><th>Model</th><th>Version</th><th>Trained</th><th>Original / app rows</th><th>Validation</th><th>Status</th></tr></thead><tbody id="registry-rows"></tbody></table></div>
