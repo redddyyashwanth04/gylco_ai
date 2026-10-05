@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS model_registry (
     n_app_rows        INTEGER NOT NULL,
     val_auc            REAL,
     val_f1              REAL,
+    val_mae             REAL,
     is_active          INTEGER NOT NULL DEFAULT 0,
     notes               TEXT
 );
@@ -81,13 +82,19 @@ def normalize_row(row, columns=None):
 
 
 def _migrate(conn):
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(visits)")}
-    if "risks_json" not in cols:
+    # visits table — columns added over time
+    visit_cols = {r[1] for r in conn.execute("PRAGMA table_info(visits)")}
+    if "risks_json" not in visit_cols:
         conn.execute("ALTER TABLE visits ADD COLUMN risks_json TEXT")
-    if "model_version_id" not in cols:
+    if "model_version_id" not in visit_cols:
         conn.execute("ALTER TABLE visits ADD COLUMN model_version_id INTEGER")
-    if "note" not in cols:
+    if "note" not in visit_cols:
         conn.execute("ALTER TABLE visits ADD COLUMN note TEXT")
+
+    # model_registry table — val_mae added in migration v2
+    registry_cols = {r[1] for r in conn.execute("PRAGMA table_info(model_registry)")}
+    if "val_mae" not in registry_cols:
+        conn.execute("ALTER TABLE model_registry ADD COLUMN val_mae REAL")
 
 
 def init_db():
@@ -160,15 +167,22 @@ def count_predictions():
     return n
 
 
-def register_model_version(model_name, n_original_rows, n_app_rows, val_auc, val_f1, notes=""):
-    """Records a candidate model version. Does NOT make it active (see promote_model)."""
+def register_model_version(model_name, n_original_rows, n_app_rows,
+                           val_auc, val_f1, val_mae=None, notes=""):
+    """Records a candidate model version. Does NOT make it active (see promote_model).
+
+    val_mae: optional numeric MAE (used by Track B forecasters). Stored in a
+             dedicated column so api_server.py can read it without regex-parsing notes.
+    """
     conn = get_connection()
     now = datetime.now().isoformat()
     cur = conn.execute(
         """INSERT INTO model_registry
-           (model_name, trained_at, n_original_rows, n_app_rows, val_auc, val_f1, is_active, notes)
-           VALUES (?, ?, ?, ?, ?, ?, 0, ?)""",
-        (model_name, now, n_original_rows, n_app_rows, val_auc, val_f1, notes),
+           (model_name, trained_at, n_original_rows, n_app_rows,
+            val_auc, val_f1, val_mae, is_active, notes)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)""",
+        (model_name, now, n_original_rows, n_app_rows,
+         val_auc, val_f1, val_mae, notes),
     )
     conn.commit()
     version_id = cur.lastrowid

@@ -13,7 +13,6 @@ const DEMO_SESSION_KEY = "carepath_demo_user";
 
 const visits = [];        // saved visits from the local database
 const tempVisits = [];    // visits without a patient ID, browser memory only
-let mimicCases = [];
 let pendingVisit = null;
 let forecastState = null;
 let explainResult = null;
@@ -60,8 +59,8 @@ function formatDate(date) {
 }
 
 function metricText(model) {
-  // Track B: both LSTM and Ridge notes contain "mean abs error N"
-  const maeMatch = /mean abs error ([\d.]+)/.exec(model.notes || "");
+  // Track B: match both "mean abs error N" (v3) and "MAE N" (v4)
+  const maeMatch = /(?:mean abs error|MAE)\s+([\d.]+)/.exec(model.notes || "");
   if (maeMatch) return `MAE ${maeMatch[1]} mg/dL`;
   // Track A: AUC stored as a numeric column
   return model.val_auc ? `AUC ${Number(model.val_auc).toFixed(3)}` : "Not recorded";
@@ -116,19 +115,15 @@ function updateTrajectoryOptions() {
   const select = byId("trajectory-patient");
   const selected = select.value;
   const patients = [...new Set(visits.map((v) => v.patientId).filter(Boolean))];
-  select.replaceChildren(new Option("Illustrative example (synthetic)", "illustrative"));
-  if (mimicCases.length) {
-    const group = document.createElement("optgroup");
-    group.label = "MIMIC-IV demo cases (ICU)";
-    mimicCases.forEach((c) => group.append(new Option(`${c.label} · ${c.totalReadings} readings`, `case:${c.id}`)));
-    select.append(group);
+
+  select.replaceChildren();
+
+  if (patients.length === 0) {
+    select.append(new Option("No tracked patients yet — save a visit first", ""));
+  } else {
+    patients.forEach((id) => select.append(new Option(id, `patient:${id}`)));
   }
-  if (patients.length) {
-    const group = document.createElement("optgroup");
-    group.label = "Tracked patients";
-    patients.forEach((id) => group.append(new Option(id, `patient:${id}`)));
-    select.append(group);
-  }
+
   if ([...select.options].some((o) => o.value === selected)) select.value = selected;
 }
 
@@ -188,7 +183,6 @@ async function connectBackend() {
     setConnectionState(true, `Using ${health.modelName} (${health.featureCount} features). Predictions run locally; this remains a research prototype.`, health.modelName);
     byId("forecast-badge").textContent = forecastAvailable ? "Forecast model available" : "Forecast artifact unavailable";
 
-    try { mimicCases = (await apiRequest("/cases")).cases; } catch { mimicCases = []; }
     let info = null;
     try { info = await apiRequest("/patients"); } catch { info = null; }
 
@@ -532,12 +526,7 @@ byId("history-rows").addEventListener("click", (event) => {
 
 /* ---------- progression forecast ---------- */
 
-const illustrativeReadings = [
-  { label: "#1", glucose: 126 }, { label: "#2", glucose: 139 }, { label: "#3", glucose: 132 },
-  { label: "#4", glucose: 158 }, { label: "#5", glucose: 149 }, { label: "#6", glucose: 171 },
-];
-
-function selectedPatientReadings() {
+function selectedReadings() {
   const selected = byId("trajectory-patient").value;
   if (!selected.startsWith("patient:")) return [];
   const patientId = selected.slice("patient:".length);
@@ -548,15 +537,6 @@ function selectedPatientReadings() {
     .map((v, i) => ({ label: `#${i + 1}`, glucose: v.glucose }));
 }
 
-function selectedReadings() {
-  const selected = byId("trajectory-patient").value;
-  if (selected.startsWith("case:")) {
-    const c = mimicCases.find((x) => `case:${x.id}` === selected);
-    return c ? c.readings.map((g, i) => ({ label: `#${i + 1}`, glucose: g })) : [];
-  }
-  return selectedPatientReadings();
-}
-
 function resetForecast() {
   forecastState = null;
   byId("forecast-result").hidden = true;
@@ -564,13 +544,13 @@ function resetForecast() {
 
 function updateForecastControls() {
   const selected = byId("trajectory-patient").value;
-  const real = selected !== "illustrative";
-  const enough = selectedReadings().length >= 4;
-  byId("forecast-button").disabled = !(backendConnected && forecastAvailable && real && enough);
+  const isPatient = selected.startsWith("patient:");
+  const enough = isPatient && selectedReadings().length >= 4;
+  byId("forecast-button").disabled = !(backendConnected && forecastAvailable && isPatient && enough);
   const status = byId("forecast-status");
   if (!backendConnected) status.textContent = "Service offline";
   else if (!forecastAvailable) status.textContent = "Artifact unavailable";
-  else if (!real) status.textContent = "Select a case or patient";
+  else if (!isPatient) status.textContent = "Select a tracked patient";
   else if (!enough) status.textContent = "Need 4 readings";
   else status.textContent = byId("forecast-result").hidden ? "Ready to run" : "Forecast ready";
 }
@@ -609,23 +589,17 @@ function drawTrajectory() {
   const canvas = byId("glucose-chart");
   const context = canvas.getContext("2d");
   const selected = byId("trajectory-patient").value;
-  const isCase = selected.startsWith("case:");
   const isPatient = selected.startsWith("patient:");
-  const readings = isCase || isPatient ? selectedReadings() : illustrativeReadings;
+  const readings = isPatient ? selectedReadings() : [];
 
   byId("reading-count").textContent = String(readings.length);
   byId("chart-empty").hidden = readings.length > 0;
   canvas.hidden = readings.length === 0;
 
-  if (isCase) {
-    const c = mimicCases.find((x) => `case:${x.id}` === selected);
-    byId("chart-caption").textContent = c
-      ? `${c.label} · ICU point-of-care glucose (de-identified) · showing last ${readings.length} of ${c.totalReadings}`
-      : "MIMIC-IV demo case";
-  } else if (isPatient) {
+  if (isPatient) {
     byId("chart-caption").textContent = `${selected.slice("patient:".length)} · saved patient glucose measurements`;
   } else {
-    byId("chart-caption").textContent = "Illustrative values only · synthetic, not patient data";
+    byId("chart-caption").textContent = "Select a tracked patient to view their glucose history";
   }
   updateForecastControls();
   if (!readings.length) return;

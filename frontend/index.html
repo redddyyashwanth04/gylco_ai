@@ -240,7 +240,7 @@
           <div class="chart-foot"><span>Dashed line: 140 mg/dL reference. Orange point: forecast, with typical error bar.</span><span>mg/dL</span></div>
         </div>
         <div class="forecast-result" id="forecast-result" hidden></div>
-        <div class="connection-note" id="forecast-note"><span class="banner-symbol">i</span><p><strong>Forecast is model-generated.</strong> The LSTM v2 ensemble (Track B) was trained on ICU point-of-care glucose from MIMIC-IV Demo (30 patients); applying it to outpatient fasting glucose is out-of-distribution. The error bar is the typical leave-one-patient-out MAE. At least four glucose readings are needed. If the LSTM artifact is unavailable the Ridge forecaster is used as fallback.</p></div>
+        <div class="connection-note" id="forecast-note"><span class="banner-symbol">i</span><p><strong>Forecast is model-generated.</strong> The LSTM v4 model (Track B) was trained on ICU point-of-care glucose from MIMIC-IV Demo patients. The error bar shows the typical leave-one-patient-out MAE. At least four glucose readings are needed to run a forecast.</p></div>
       </section>
 
       <!-- PATIENT HISTORY -->

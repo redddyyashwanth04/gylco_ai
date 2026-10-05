@@ -18,11 +18,15 @@ import pandas as pd
 TARGETS = ["hypertension", "nephropathy", "cardiovascular"]
 
 
-_MODEL_CACHE: dict = {}   # {name, model, feature_cols, mtime}
+_MODEL_CACHE: dict = {}   # keys: name, model, feature_cols, mtime, medians
 
 
 def load_active_model():
-    """Load the active Track A model. Reloads automatically if the artifact changes on disk."""
+    """Load the active Track A model. Reloads automatically if the artifact changes on disk.
+
+    Training medians are computed once here and cached so predict_patient()
+    never reads the training CSV again (P2 fix: was re-reading on every request).
+    """
     name_path = MODELS_SAVED / "nhanes_active_name.txt"
     name = name_path.read_text().strip()
     pkl_path = MODELS_SAVED / f"{name}.pkl"
@@ -36,7 +40,12 @@ def load_active_model():
     with open(MODELS_SAVED / "nhanes_feature_columns.pkl", "rb") as f:
         feature_cols = pickle.load(f)
 
-    _MODEL_CACHE.update(name=name, model=model, feature_cols=feature_cols, mtime=mtime)
+    # Compute and cache medians once — avoids re-reading the 8k-row CSV on every prediction.
+    train_path = Path(__file__).resolve().parent.parent.parent / "data" / "model_ready" / "nhanes_model_ready.csv"
+    medians = pd.read_csv(train_path)[feature_cols].median()
+
+    _MODEL_CACHE.update(name=name, model=model, feature_cols=feature_cols,
+                        mtime=mtime, medians=medians)
     return name, model, feature_cols
 
 
@@ -73,10 +82,7 @@ def predict_patient(patient_values):
     name, model, feature_cols = load_active_model()
     row = add_engineered_features(patient_values)
     x = pd.DataFrame([row]).reindex(columns=feature_cols)
-
-    train = pd.read_csv(Path(__file__).resolve().parent.parent.parent / "data" / "model_ready" / "nhanes_model_ready.csv")
-    x = x.fillna(train[feature_cols].median())
-
+    x = x.fillna(_MODEL_CACHE["medians"])  # cached at model load — no CSV read per request
     probas = model.predict_proba(x)
     return {t: float(probas[i][0, 1]) for i, t in enumerate(TARGETS)}, name, x
 

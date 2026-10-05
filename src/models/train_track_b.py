@@ -97,7 +97,8 @@ def main():
     init_db()
     version_id = register_model_version(
         model_name="mimic_glucose_forecaster", n_original_rows=n_real, n_app_rows=0,
-        val_auc=0.0, val_f1=0.0, notes=f"{best}, mean abs error {results[best]:.1f} mg/dL, LOPO-CV")
+        val_auc=0.0, val_f1=0.0, val_mae=results[best],
+        notes=f"{best}, mean abs error {results[best]:.1f} mg/dL, LOPO-CV")
     promote_model(version_id, "mimic_glucose_forecaster")
     print(f"Registered as mimic_glucose_forecaster, version {version_id}")
 

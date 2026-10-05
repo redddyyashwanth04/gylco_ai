@@ -8,7 +8,6 @@ Binds to loopback only; not suitable for network or production use.
 
 import json
 import pickle
-import re
 import sys
 from math import isfinite
 from http import HTTPStatus
@@ -19,7 +18,7 @@ from urllib.parse import unquote, urlparse
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from config import MODELS_SAVED, MIMIC_TRAJECTORIES
+from config import MODELS_SAVED
 from src.models.predict import (
     TARGETS,
     compute_risk_delta,
@@ -27,6 +26,7 @@ from src.models.predict import (
     load_active_model,
     predict_patient,
 )
+from src.models.train_lstm import predict_from_checkpoint
 from src.storage.db import (
     add_visit,
     count_predictions,
@@ -43,13 +43,11 @@ PORT = 5001
 ALLOWED_ORIGINS = {
     "http://127.0.0.1:5001",
     "http://localhost:5001",
-    # kept for compatibility if someone still has a Vite dev server running
     "http://127.0.0.1:5173",
     "http://localhost:5173",
 }
 FRONTEND_DIR = ROOT / "frontend"
 MAX_BODY_BYTES = 64 * 1024
-MAX_CASES = 12
 VALUE_RANGES = {
     "RIDAGEYR": (18, 100),
     "LBXGH": (3, 15),
@@ -59,11 +57,10 @@ VALUE_RANGES = {
     "BPXODI1": (40, 150),
     "LBDLDL": (30, 300),
     "LBDHDD": (15, 120),
-    # optional lifestyle / demographic fields
-    "RIAGENDR": (1, 2),        # 1=Male, 2=Female
-    "SMQ020": (1, 3),          # 1=current smoker, 2=former, 3=never
-    "PAD680": (0, 24),         # sedentary hours per day
-    "INDFMPIR": (0, 5),        # income-to-poverty ratio
+    "RIAGENDR": (1, 2),
+    "SMQ020": (1, 3),
+    "PAD680": (0, 24),
+    "INDFMPIR": (0, 5),
 }
 
 
@@ -95,118 +92,24 @@ def validate_values(values, required_fields=()):
 
 
 def forecaster_expected_error(model_name: str) -> float | None:
-    """Leave-one-patient-out MAE parsed from the registry notes for the named forecaster."""
+    """Return the LOPO-CV MAE for the active version of a forecaster.
+
+    Reads the dedicated val_mae column added in db migration v2.
+    Falls back to regex-parsing the notes field for older registry rows
+    that pre-date the column (keeps the server working across upgrades).
+    """
     active = get_active_model_version(model_name)
     if not active:
         return None
-    match = re.search(r"mean abs error ([\d.]+)", active.get("notes") or "")
+    # Primary: dedicated numeric column (added in db migration v2)
+    val_mae = active.get("val_mae")
+    if val_mae is not None:
+        return float(val_mae)
+    # Fallback: parse free-text notes for rows written before migration v2
+    import re
+    notes = active.get("notes") or ""
+    match = re.search(r"(?:mean abs error|MAE)\s+([\d.]+)", notes)
     return float(match.group(1)) if match else None
-
-
-# ---------- LSTM forecaster helpers ------------------------------------------
-
-_LSTM_CACHE: dict = {}   # lazily loaded; cleared automatically when the .pt file changes
-
-
-def _load_lstm():
-    """Load the LSTM ensemble from mimic_lstm_forecaster.pt.
-
-    Reloads automatically if the file has been replaced since last load.
-    Returns (models, config) or raises FileNotFoundError / ImportError.
-    """
-    import torch
-    from src.models.train_lstm import GlucoseLSTM
-
-    pt_path = MODELS_SAVED / "mimic_lstm_forecaster.pt"
-    if not pt_path.exists():
-        raise FileNotFoundError(f"LSTM artifact not found at {pt_path}")
-
-    current_mtime = pt_path.stat().st_mtime
-    if _LSTM_CACHE.get("mtime") == current_mtime:
-        return _LSTM_CACHE["models"], _LSTM_CACHE["config"]
-
-    # (Re)load — either first call or file was updated by a retrain
-    checkpoint = torch.load(pt_path, map_location="cpu", weights_only=False)
-    cfg = checkpoint["config"]
-
-    hidden     = cfg.get("hidden", 64)
-    num_layers = cfg.get("num_layers", 1)   # v2 artifacts have 1 layer
-    dropout    = cfg.get("dropout", 0.2)
-
-    models = []
-    for state in checkpoint["states"]:
-        m = GlucoseLSTM(hidden=hidden, num_layers=num_layers, dropout=dropout)
-        m.load_state_dict(state)
-        m.eval()
-        models.append(m)
-
-    _LSTM_CACHE.clear()
-    _LSTM_CACHE["models"]          = models
-    _LSTM_CACHE["config"]          = cfg
-    _LSTM_CACHE["mtime"]           = current_mtime
-    # v3 blend weights (absent in older artifacts → alpha=1.0 means LSTM-only)
-    _LSTM_CACHE["blend_alpha"]     = float(checkpoint.get("blend_alpha", 1.0))
-    _LSTM_CACHE["ridge_coef"]      = checkpoint.get("ridge_coef")
-    _LSTM_CACHE["ridge_intercept"] = checkpoint.get("ridge_intercept", 0.0)
-    return models, cfg
-
-
-def _lstm_predict(readings: list[float], gap_hours: list[float] | None = None) -> float:
-    """Run the LSTM+Ridge blend on `readings` (last window-1 values used).
-
-    gap_hours: time gaps between consecutive readings in hours.
-    If not supplied, uniform gaps are assumed (USE_TIME effectively False).
-
-    v3: blends LSTM delta with Ridge prediction using the alpha learned during training.
-    Falls back gracefully to LSTM-only when the artifact has no Ridge weights (v2).
-    """
-    import torch
-    import numpy as np
-
-    models, cfg = _load_lstm()
-    mu: float        = cfg["mu"]
-    sd: float        = cfg["sd"]
-    window: int      = cfg.get("window", 5)
-    use_time: bool   = cfg.get("use_time", True)
-    alpha: float     = _LSTM_CACHE.get("blend_alpha", 1.0)   # 1.0 = LSTM only
-    ridge_coef       = _LSTM_CACHE.get("ridge_coef")
-    ridge_intercept  = float(_LSTM_CACHE.get("ridge_intercept") or 0.0)
-
-    n_in = window - 1          # number of input readings (7 with window=8)
-    vals = np.array(readings[-n_in:], dtype=float)
-    last = vals[-1]
-
-    # Build time-gap features: log1p(gap_hours)/5, or zeros when not supplied
-    if use_time and gap_hours is not None and len(gap_hours) >= n_in:
-        raw_gaps = np.array(gap_hours[-n_in:], dtype=float)
-    else:
-        raw_gaps = np.zeros(n_in, dtype=float)
-
-    step_gap = np.log1p(np.clip(raw_gaps, 0, None)) / 5
-
-    # LSTM input tensor: (1, n_in, 2)  [scaled glucose, scaled gap]
-    scaled_vals = (vals - mu) / sd
-    x = torch.tensor(np.stack([scaled_vals, step_gap], axis=1)[None], dtype=torch.float32)
-
-    last_gap = float(raw_gaps[-1]) if raw_gaps[-1] > 0 else float(raw_gaps.mean()) if raw_gaps.any() else 1.0
-    h = torch.tensor([[np.log1p(last_gap) / 5]], dtype=torch.float32)
-
-    with torch.no_grad():
-        delta_scaled = torch.stack([m(x, h) for m in models]).mean(0).item()
-
-    lstm_forecast = float(last + delta_scaled * sd)
-
-    # Apply Ridge blend when weights are present in the artifact
-    if ridge_coef is not None and alpha < 1.0:
-        last_diff = float(vals[-1] - vals[-2]) if len(vals) >= 2 else 0.0
-        ridge_features = np.concatenate([
-            vals,
-            [vals.mean(), vals.std(), vals[-1] - vals[0], last_diff],
-        ])
-        ridge_forecast = float(np.dot(ridge_coef, ridge_features) + ridge_intercept)
-        return alpha * lstm_forecast + (1.0 - alpha) * ridge_forecast
-
-    return lstm_forecast
 
 
 
@@ -307,8 +210,6 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.get_models()
             elif path == "/api/patients":
                 self.get_patients()
-            elif path == "/api/cases":
-                self.get_cases()
             elif path.startswith("/api/patients/") and path.endswith("/visits"):
                 patient_id = unquote(path[len("/api/patients/"):-len("/visits")].strip("/"))
                 self.get_patient_visits(patient_id)
@@ -354,7 +255,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             lstm_available  = (MODELS_SAVED / "mimic_lstm_forecaster.pt").exists()
             ridge_available = (MODELS_SAVED / "mimic_glucose_forecaster.pkl").exists()
             forecast_available = lstm_available or ridge_available
-            forecast_model = "LSTM v2" if lstm_available else ("Ridge" if ridge_available else None)
+            forecast_model = "LSTM v4" if lstm_available else ("Ridge" if ridge_available else None)
             self.send_json(HTTPStatus.OK, {
                 "connected": True,
                 "modelName": model_name,
@@ -402,7 +303,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         try:
             rows = connection.execute(
                 """SELECT model_name, version_id, trained_at, n_original_rows,
-                          n_app_rows, val_auc, val_f1, is_active, notes
+                          n_app_rows, val_auc, val_f1, val_mae, is_active, notes
                    FROM model_registry ORDER BY model_name, trained_at DESC"""
             ).fetchall()
             self.send_json(HTTPStatus.OK, {"models": [dict(row) for row in rows]})
@@ -410,26 +311,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             connection.close()
 
     def get_cases(self):
-        """Pre-loaded MIMIC-IV demo glucose trajectories (Mode 2 examples). Subject IDs are not exposed."""
-        import pandas as pd
-
-        if not MIMIC_TRAJECTORIES.exists():
-            self.send_json(HTTPStatus.OK, {"cases": []})
-            return
-        traj = pd.read_csv(MIMIC_TRAJECTORIES, parse_dates=["charttime"])
-        glucose = traj[traj["lab_name"] == "glucose"].dropna(subset=["valuenum"])
-        groups = [g.sort_values("charttime") for _, g in glucose.groupby("subject_id") if len(g) >= 5]
-        groups.sort(key=len, reverse=True)
-        cases = []
-        for grp in groups[:MAX_CASES]:
-            n = len(cases) + 1
-            cases.append({
-                "id": f"mimic-{n}",
-                "label": f"MIMIC-IV demo case {n}",
-                "totalReadings": int(len(grp)),
-                "readings": [float(v) for v in grp["valuenum"].tail(40)],
-            })
-        self.send_json(HTTPStatus.OK, {"cases": cases})
+        """Kept for backward compatibility — returns empty list. Cases removed from UI."""
+        self.send_json(HTTPStatus.OK, {"cases": []})
 
     # ---------- POST handlers ----------
 
@@ -505,50 +388,45 @@ class ApiHandler(BaseHTTPRequestHandler):
         if not isinstance(readings, list):
             raise ValueError("A list of glucose readings is required.")
 
-        # Minimum readings required: window - 1 (loaded dynamically from model config)
-        # Hard-floor of 4 for backward compat; actual requirement resolved after model load.
         MIN_READINGS = 4
         if len(readings) < MIN_READINGS:
             raise ValueError(f"At least {MIN_READINGS} glucose readings are required.")
 
         readings = [float(v) for v in readings]
-        gap_hours = payload.get("gap_hours")   # optional list of hour-gaps between readings
+        gap_hours = payload.get("gap_hours")
         if gap_hours is not None:
             if not isinstance(gap_hours, list):
                 gap_hours = None
             else:
                 gap_hours = [float(g) for g in gap_hours]
 
-        # --- Try LSTM first, fall back to Ridge ---
-        lstm_path = MODELS_SAVED / "mimic_lstm_forecaster.pt"
+        lstm_path  = MODELS_SAVED / "mimic_lstm_forecaster.pt"
         ridge_path = MODELS_SAVED / "mimic_glucose_forecaster.pkl"
 
         forecast: float | None = None
-        forecaster_name: str = "unavailable"
+        forecaster_name = "unavailable"
         expected_error: float | None = None
 
         if lstm_path.exists():
             try:
-                forecast = _lstm_predict(readings, gap_hours)
-                forecaster_name = "LSTM v3 + Ridge blend"
+                forecast = predict_from_checkpoint(lstm_path, readings, gap_hours)
+                forecaster_name = "LSTM v4 + Ridge blend"
                 expected_error = forecaster_expected_error("mimic_glucose_forecaster_lstm")
             except Exception as exc:
                 self.log_error("LSTM forecast failed (%s); falling back to Ridge", exc)
-                forecast = None
 
         if forecast is None and ridge_path.exists():
             from src.models.train_track_b import WINDOW as RIDGE_WINDOW, make_features
             with open(ridge_path, "rb") as fh:
                 ridge = pickle.load(fh)
-            recent = readings[-(RIDGE_WINDOW - 1):]
-            forecast = float(ridge.predict([make_features(recent)])[0])
+            forecast = float(ridge.predict([make_features(readings[-(RIDGE_WINDOW - 1):])])[0])
             forecaster_name = "Ridge"
             expected_error = forecaster_expected_error("mimic_glucose_forecaster")
 
         if forecast is None:
             self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {
                 "error": "No forecast model artifact is available. "
-                         "Run src/models/train_lstm.py or src/models/train_track_b.py first.",
+                         "Run src/models/train_lstm.py first.",
             })
             return
 
