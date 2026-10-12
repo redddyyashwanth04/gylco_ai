@@ -1,0 +1,1 @@
+{"targets": ["hypertension", "nephropathy", "cardiovascular"], "prefix": "nhanes_rf_", "thresholds": {"hypertension": 0.42, "nephropathy": 0.44, "cardiovascular": 0.43}}
