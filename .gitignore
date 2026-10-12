@@ -19,8 +19,8 @@ data/app_state.db
 
 # Trained model artifacts (large binary files -- track via a model registry
 # entry + external storage if needed, not git)
-# models_saved/*
-# !models_saved/.gitkeep
+models_saved/*
+!models_saved/.gitkeep
 
 # Secrets
 .env
