@@ -18,15 +18,20 @@ import pandas as pd
 TARGETS = ["hypertension", "nephropathy", "cardiovascular"]
 
 
-_MODEL_CACHE: dict = {}   # keys: name, model, feature_cols, mtime, medians
+_MODEL_CACHE: dict = {}     # keys: name, model, feature_cols, mtime, medians
+_PER_LABEL_CACHE: dict = {} # keys: mtime, models, feature_cols, medians, thresholds
+
+# Default thresholds — used before the first training run with threshold tuning
+# and as fallback if nhanes_thresholds.json is missing.
+_DEFAULT_THRESHOLDS = {
+    "hypertension":  0.42,
+    "nephropathy":   0.44,
+    "cardiovascular": 0.43,
+}
 
 
 def load_active_model():
-    """Load the active Track A model. Reloads automatically if the artifact changes on disk.
-
-    Training medians are computed once here and cached so predict_patient()
-    never reads the training CSV again (P2 fix: was re-reading on every request).
-    """
+    """Load the active Track A multi-output model. Auto-reloads on artifact change."""
     name_path = MODELS_SAVED / "nhanes_active_name.txt"
     name = name_path.read_text().strip()
     pkl_path = MODELS_SAVED / f"{name}.pkl"
@@ -40,13 +45,84 @@ def load_active_model():
     with open(MODELS_SAVED / "nhanes_feature_columns.pkl", "rb") as f:
         feature_cols = pickle.load(f)
 
-    # Compute and cache medians once — avoids re-reading the 8k-row CSV on every prediction.
     train_path = Path(__file__).resolve().parent.parent.parent / "data" / "model_ready" / "nhanes_model_ready.csv"
     medians = pd.read_csv(train_path)[feature_cols].median()
 
     _MODEL_CACHE.update(name=name, model=model, feature_cols=feature_cols,
                         mtime=mtime, medians=medians)
     return name, model, feature_cols
+
+
+def load_per_label_models(patient_values: dict) -> tuple:
+    """Load three separate per-label RF models, apply tuned thresholds, and return predictions.
+
+    Returns:
+        per_label_models : {target: fitted RandomForestClassifier}
+        feature_cols     : list[str]
+        risks            : {target: float probability}   ← raw probabilities for SHAP
+        medians          : pd.Series
+
+    Thresholds are stored in nhanes_thresholds.json by train_all.py.
+    They are loaded once and cached alongside the models. The raw probability
+    is returned (not the binary decision) so the SHAP path in explain.py always
+    works with continuous values. The binary risk classification uses the threshold
+    in generate_clinical_recommendations() and the frontend display logic.
+    """
+    import json
+
+    pointer_path = MODELS_SAVED / "nhanes_per_label_active.json"
+
+    if not pointer_path.exists():
+        # Graceful fallback: unpack multi-output model
+        name, multi_model, feature_cols = load_active_model()
+        row = add_engineered_features(patient_values)
+        x   = pd.DataFrame([row]).reindex(columns=feature_cols).fillna(_MODEL_CACHE["medians"])
+        probas = multi_model.predict_proba(x)
+        risks  = {t: float(probas[i][0, 1]) for i, t in enumerate(TARGETS)}
+        per_label = {t: multi_model.estimators_[i] for i, t in enumerate(TARGETS)}
+        return per_label, feature_cols, risks, _MODEL_CACHE["medians"]
+
+    # Check cache freshness using mtime of hypertension artifact as proxy
+    mtime_key = (MODELS_SAVED / "nhanes_rf_hypertension.pkl").stat().st_mtime
+    if _PER_LABEL_CACHE.get("mtime") == mtime_key:
+        per_label    = _PER_LABEL_CACHE["models"]
+        feature_cols = _PER_LABEL_CACHE["feature_cols"]
+        medians      = _PER_LABEL_CACHE["medians"]
+        thresholds   = _PER_LABEL_CACHE["thresholds"]
+    else:
+        with open(MODELS_SAVED / "nhanes_feature_columns.pkl", "rb") as f:
+            feature_cols = pickle.load(f)
+        train_path = Path(__file__).resolve().parent.parent.parent / "data" / "model_ready" / "nhanes_model_ready.csv"
+        medians = pd.read_csv(train_path)[feature_cols].median()
+        per_label = {}
+        for target in TARGETS:
+            with open(MODELS_SAVED / f"nhanes_rf_{target}.pkl", "rb") as f:
+                per_label[target] = pickle.load(f)
+        # Load tuned thresholds — fall back to defaults if file absent
+        thresh_path = MODELS_SAVED / "nhanes_thresholds.json"
+        if thresh_path.exists():
+            thresholds = json.loads(thresh_path.read_text(encoding="utf-8"))
+        else:
+            thresholds = dict(_DEFAULT_THRESHOLDS)
+        _PER_LABEL_CACHE.update(mtime=mtime_key, models=per_label,
+                                feature_cols=feature_cols, medians=medians,
+                                thresholds=thresholds)
+
+    row = add_engineered_features(patient_values)
+    x   = pd.DataFrame([row]).reindex(columns=feature_cols).fillna(medians)
+    # Return raw probabilities — thresholds live in _PER_LABEL_CACHE["thresholds"]
+    # for use by the API layer; SHAP needs continuous values
+    risks = {
+        t: float(per_label[t].predict_proba(x)[0, 1]) for t in TARGETS
+    }
+    return per_label, feature_cols, risks, medians
+
+
+def get_thresholds() -> dict:
+    """Return the per-label classification thresholds (tuned or defaults).
+    Call after load_per_label_models() to ensure the cache is populated.
+    """
+    return _PER_LABEL_CACHE.get("thresholds", dict(_DEFAULT_THRESHOLDS))
 
 
 def add_engineered_features(p):
@@ -111,7 +187,10 @@ def generate_clinical_recommendations(patient_values, risks):
     """
     Points for clinician review. These are considerations, not orders: the
     tool supports the clinician's decision and never makes it.
+    Uses tuned per-label thresholds (loaded from nhanes_thresholds.json) so the
+    "elevated" flag matches the F1-optimised decision boundary, not an arbitrary 0.5.
     """
+    thresh = get_thresholds()
     recs = []
     bmi = patient_values.get("BMXBMI") or 0
     hba1c = patient_values.get("LBXGH") or 0
@@ -121,11 +200,11 @@ def generate_clinical_recommendations(patient_values, risks):
     hdl = patient_values.get("LBDHDD")
     total_chol = patient_values.get("LBXTC")
 
-    if risks.get("hypertension", 0) >= 0.5 or systolic >= 130 or diastolic >= 80:
+    if risks.get("hypertension", 0) >= thresh["hypertension"] or systolic >= 130 or diastolic >= 80:
         recs.append("Hypertension risk is elevated. Consider reviewing blood pressure control, home readings, and medication adherence.")
-    if risks.get("nephropathy", 0) >= 0.5:
+    if risks.get("nephropathy", 0) >= thresh["nephropathy"]:
         recs.append("Estimated nephropathy risk is elevated. Consider reviewing albuminuria and kidney function results, and whether earlier renal review is warranted if the risk trend is rising.")
-    if risks.get("cardiovascular", 0) >= 0.5 or bmi >= 30 or (hdl and total_chol and total_chol / hdl > 5):
+    if risks.get("cardiovascular", 0) >= thresh["cardiovascular"] or bmi >= 30 or (hdl and total_chol and total_chol / hdl > 5):
         recs.append("Cardiovascular risk markers are elevated. Consider reviewing lipid management, smoking, activity, and nutrition with the patient.")
     if bmi >= 30:
         recs.append("BMI is in the obesity range. Lifestyle support (activity, meal planning, weight goals) may be worth discussing.")

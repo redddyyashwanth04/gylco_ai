@@ -43,6 +43,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from config import DATA_MODEL_READY, MIMIC_TRAJECTORIES, MODELS_SAVED
 from src.features.augmentation import jitter
+from src.metrics.training_log import TrainingRun
 from src.storage.db import init_db, promote_model, register_model_version
 
 # -- shared constants ---------------------------------------------------------
@@ -84,6 +85,7 @@ def _eval_a(model, X_te, y_te):
     y_pred  = model.predict(X_te)
     y_proba = model.predict_proba(X_te)
     aucs, f1s = [], []
+    per_target = {}
     for i, col in enumerate(TARGET_COLUMNS):
         try:
             auc = roc_auc_score(y_te[col], y_proba[i][:, 1])
@@ -92,8 +94,11 @@ def _eval_a(model, X_te, y_te):
             auc = 0.0
         f1 = f1_score(y_te[col], y_pred[:, i], zero_division=0)
         f1s.append(f1)
+        per_target[col] = {"auc": round(float(auc), 4), "f1": round(float(f1), 4)}
         print(f"    {col:15s}  AUC={round(auc, 3):<6}  F1={round(f1, 3)}")
-    return float(np.mean(aucs)) if aucs else 0.0, float(np.mean(f1s))
+    mean_auc = float(np.mean(aucs)) if aucs else 0.0
+    mean_f1  = float(np.mean(f1s))
+    return mean_auc, mean_f1, per_target
 
 
 def _save_pkl(obj, name: str) -> Path:
@@ -119,31 +124,95 @@ def train_track_a():
     X_tr, X_te, y_tr, y_te, feat_cols = _split_nhanes(df)
     print(f"Train: {len(X_tr)} rows | Test: {len(X_te)} rows | Features: {len(feat_cols)}")
 
-    # 1. Logistic Regression
+    # 1. Logistic Regression (multi-output, for AUC comparison only)
     print("\n  Logistic Regression (traditional baseline)")
     lr = MultiOutputClassifier(
         make_pipeline(StandardScaler(),
                       LogisticRegression(class_weight="balanced", max_iter=2000))
     ).fit(X_tr, y_tr)
-    lr_auc, lr_f1 = _eval_a(lr, X_te, y_te)
+    lr_auc, lr_f1, lr_per = _eval_a(lr, X_te, y_te)
     _save_pkl(lr, "nhanes_traditional_baseline")
     print(f"  -> mean AUC={round(lr_auc, 3)}  F1={round(lr_f1, 3)}")
 
-    # 2. Random Forest
-    print("\n  Random Forest")
+    # 2. Random Forest — multi-output wrapper for AUC comparison
+    print("\n  Random Forest (multi-output, for comparison)")
     rf = MultiOutputClassifier(
         RandomForestClassifier(class_weight="balanced", n_estimators=300, random_state=42)
     ).fit(X_tr, y_tr)
-    rf_auc, rf_f1 = _eval_a(rf, X_te, y_te)
+    rf_auc, rf_f1, rf_per = _eval_a(rf, X_te, y_te)
     _save_pkl(rf, "nhanes_random_forest")
     print(f"  -> mean AUC={round(rf_auc, 3)}  F1={round(rf_f1, 3)}")
+
+    # 2b. Random Forest — THREE SEPARATE per-label models (for SHAP + tuned thresholds)
+    #     - n_estimators=500, min_samples_leaf=2: better generalisation on imbalanced data
+    #     - Per-label threshold tuned via 5-fold CV on training data (no test leakage)
+    #       so the reported F1 is honest and reproducible on unseen data.
+    print("\n  Random Forest — per-label models (for SHAP + threshold tuning)")
+    import json
+    from sklearn.model_selection import StratifiedKFold
+    from sklearn.metrics import roc_auc_score, f1_score
+
+    def _find_threshold_cv(model_cls, model_params, X_tr, y_tr_t, n_splits=5):
+        """Find F1-maximising threshold on CV val folds (no test data used)."""
+        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+        val_probas, val_true = [], []
+        for ti, vi in skf.split(X_tr, y_tr_t):
+            m = model_cls(**model_params)
+            m.fit(X_tr.iloc[ti], y_tr_t.iloc[ti])
+            val_probas.extend(m.predict_proba(X_tr.iloc[vi])[:, 1])
+            val_true.extend(y_tr_t.iloc[vi])
+        best_t, best_f = 0.5, 0.0
+        for t in np.linspace(0.15, 0.65, 51):
+            f = f1_score(val_true, np.array(val_probas) >= t, zero_division=0)
+            if f > best_f:
+                best_f, best_t = f, float(t)
+        return round(best_t, 3)
+
+    rf_params = dict(class_weight="balanced", n_estimators=500,
+                     min_samples_leaf=2, random_state=42)
+    per_label_aucs, per_label_f1s, thresholds = {}, {}, {}
+    per_label_per_target = {}
+
+    for target in TARGET_COLUMNS:
+        thresh = _find_threshold_cv(RandomForestClassifier, rf_params, X_tr, y_tr[target])
+        thresholds[target] = thresh
+
+        rf_single = RandomForestClassifier(**rf_params).fit(X_tr, y_tr[target])
+        proba_single = rf_single.predict_proba(X_te)[:, 1]
+        auc_s = float(roc_auc_score(y_te[target], proba_single))
+        f1_default = float(f1_score(y_te[target], proba_single >= 0.5, zero_division=0))
+        f1_tuned   = float(f1_score(y_te[target], proba_single >= thresh, zero_division=0))
+        per_label_aucs[target] = auc_s
+        per_label_f1s[target]  = f1_tuned
+        per_label_per_target[target] = {
+            "auc": round(auc_s, 4), "f1": round(f1_tuned, 4),
+            "f1_default_thresh": round(f1_default, 4), "threshold": thresh,
+        }
+        _save_pkl(rf_single, f"nhanes_rf_{target}")
+        print(f"    {target:15s}  AUC={auc_s:.3f}  F1@0.5={f1_default:.3f}"
+              f"  F1@{thresh}={f1_tuned:.3f}  (+{f1_tuned - f1_default:+.3f})")
+
+    # Save thresholds so predict.py applies them at inference time
+    (MODELS_SAVED / "nhanes_thresholds.json").write_text(
+        json.dumps(thresholds, indent=2), encoding="utf-8"
+    )
+    # Update pointer file
+    (MODELS_SAVED / "nhanes_per_label_active.json").write_text(
+        json.dumps({"targets": TARGET_COLUMNS, "prefix": "nhanes_rf_",
+                    "thresholds": thresholds}),
+        encoding="utf-8",
+    )
+    mean_pl_auc = float(np.mean(list(per_label_aucs.values())))
+    mean_pl_f1  = float(np.mean(list(per_label_f1s.values())))
+    print(f"  Mean per-label  AUC={mean_pl_auc:.3f}  F1(tuned)={mean_pl_f1:.3f}"
+          f"  (baseline was 0.461)")
 
     # 3. Gradient Boosting
     print("\n  Gradient Boosting")
     gb = MultiOutputClassifier(
         HistGradientBoostingClassifier(class_weight="balanced", random_state=42)
     ).fit(X_tr, y_tr)
-    gb_auc, gb_f1 = _eval_a(gb, X_te, y_te)
+    gb_auc, gb_f1, gb_per = _eval_a(gb, X_te, y_te)
     _save_pkl(gb, "nhanes_gradient_boosting")
     print(f"  -> mean AUC={round(gb_auc, 3)}  F1={round(gb_f1, 3)}")
 
@@ -155,9 +224,9 @@ def train_track_a():
     print("  +--------------------------------------------------+")
 
     # Promote best nonlinear model by AUC
-    best_name, best_auc, best_f1 = max(
-        [("nhanes_random_forest",     rf_auc, rf_f1),
-         ("nhanes_gradient_boosting", gb_auc, gb_f1)],
+    best_name, best_auc, best_f1, best_per = max(
+        [("nhanes_random_forest",     rf_auc, rf_f1, rf_per),
+         ("nhanes_gradient_boosting", gb_auc, gb_f1, gb_per)],
         key=lambda t: t[1],
     )
     version_id = register_model_version(
@@ -172,7 +241,28 @@ def train_track_a():
         pickle.dump(feat_cols, fh)
 
     print(f"\n  [OK] Active Track A model -> {best_name}  (registry v{version_id})")
-    return best_name, best_auc, best_f1
+
+    # Metrics dict for training log
+    a_metrics = {
+        "n_train": len(X_tr),
+        "n_test":  len(X_te),
+        "n_features": len(feat_cols),
+        "models": {
+            "logistic_regression": {"auc": round(lr_auc, 4), "f1": round(lr_f1, 4), "per_target": lr_per},
+            "random_forest":       {"auc": round(rf_auc, 4), "f1": round(rf_f1, 4), "per_target": rf_per},
+            "gradient_boosting":   {"auc": round(gb_auc, 4), "f1": round(gb_f1, 4), "per_target": gb_per},
+            "random_forest_tuned": {"auc": round(mean_pl_auc, 4), "f1": round(mean_pl_f1, 4),
+                                    "per_target": per_label_per_target,
+                                    "thresholds": thresholds},
+        },
+        "winner": best_name,
+        "winner_auc": best_auc,
+        "winner_f1":  best_f1,
+        "winner_f1_tuned": round(mean_pl_f1, 4),
+        "thresholds": thresholds,
+        "registry_version": version_id,
+    }
+    return best_name, best_auc, best_f1, a_metrics
 
 
 # =============================================================================
@@ -347,10 +437,10 @@ def _flat_ridge(D, idx):
 
 def _summarize_b(name, errs, pids):
     errs, pids = np.array(errs), np.array(pids)
-    macro  = np.mean([errs[pids == p].mean() for p in np.unique(pids)])
-    pooled = float(errs.mean())
-    print(f"  {name:35s}  pooled MAE {pooled:6.1f}   per-patient MAE {macro:6.1f}")
-    return pooled
+    per_patient = float(np.mean([errs[pids == p].mean() for p in np.unique(pids)]))
+    pooled      = float(errs.mean())
+    print(f"  {name:35s}  pooled MAE {pooled:6.1f}   per-patient MAE {per_patient:6.1f}")
+    return pooled, per_patient
 
 
 def train_track_b():
@@ -443,10 +533,11 @@ def train_track_b():
     print(f"\n  Average blend alpha (LSTM weight): {mean_alpha:.2f}")
     print(f"\n  Leave-one-patient-out results (gap < {GAP_MAX_HOURS}h, mg/dL ↓):")
     mae_results = {name: _summarize_b(name, e, pids) for name, e in errs.items()}
+    # mae_results[name] is now (pooled, per_patient) tuple
 
-    scored = {k: v for k, v in mae_results.items() if k != "Naive"}
+    scored = {k: v[0] for k, v in mae_results.items() if k != "Naive"}
     winner = min(scored, key=scored.get)
-    naive_mae = mae_results["Naive"]
+    naive_mae = mae_results["Naive"][0]
     print(f"\n  Winner: {winner}  (pooled MAE {scored[winner]:.1f} mg/dL)")
     print(f"  vs naive baseline: {naive_mae:.1f} mg/dL")
     improvement = naive_mae - scored[winner]
@@ -510,7 +601,27 @@ def train_track_b():
     )
     promote_model(version_id, "mimic_glucose_forecaster_lstm")
     print(f"  [OK] Active Track B model -> mimic_glucose_forecaster_lstm  (registry v{version_id})")
-    return winner, mae_val
+
+    # Metrics dict for training log
+    b_metrics = {
+        "n_real_patients":  len(set(D.groups)),
+        "n_real_windows":   int(real.sum()),
+        "n_total_windows":  len(D.y),
+        "gap_max_hours":    GAP_MAX_HOURS,
+        "window_size":      WINDOW,
+        "seeds":            SEEDS,
+        "blend_alpha":      mean_alpha,
+        "pretrain_used":    pretrained_state is not None,
+        "models":           {k: {"pooled": round(v[0], 2), "per_patient": round(v[1], 2)}
+                             for k, v in mae_results.items()},
+        "winner":           winner,
+        "winner_pooled_mae": mae_val,
+        "naive_mae":        naive_mae,
+        "improvement_mae":  improvement,
+        "improvement_pct":  improvement / naive_mae * 100,
+        "registry_version": version_id,
+    }
+    return winner, mae_val, b_metrics
 
 
 # =============================================================================
@@ -525,8 +636,45 @@ def main():
     if QUICK:
         print("(--quick mode: 1 LSTM seed, 30 max epochs)")
 
-    a_name, a_auc, a_f1 = train_track_a()
-    b_name, b_mae       = train_track_b()
+    run = TrainingRun()
+
+    a_name, a_auc, a_f1, a_metrics = train_track_a()
+    run.set_track_a(
+        n_train          = a_metrics["n_train"],
+        n_test           = a_metrics["n_test"],
+        n_features       = a_metrics["n_features"],
+        models           = a_metrics["models"],
+        winner           = a_metrics["winner"],
+        winner_auc       = a_metrics["winner_auc"],
+        winner_f1        = a_metrics["winner_f1"],
+        registry_version = a_metrics["registry_version"],
+    )
+
+    b_result = train_track_b()
+    if b_result[0] is not None:
+        b_name, b_mae, b_metrics = b_result
+        run.set_track_b(
+            n_real_patients  = b_metrics["n_real_patients"],
+            n_real_windows   = b_metrics["n_real_windows"],
+            n_total_windows  = b_metrics["n_total_windows"],
+            gap_max_hours    = b_metrics["gap_max_hours"],
+            window_size      = b_metrics["window_size"],
+            seeds            = b_metrics["seeds"],
+            blend_alpha      = b_metrics["blend_alpha"],
+            mae_results      = b_metrics["models"],
+            winner           = b_metrics["winner"],
+            winner_pooled_mae= b_metrics["winner_pooled_mae"],
+            naive_mae        = b_metrics["naive_mae"],
+            improvement_mae  = b_metrics["improvement_mae"],
+            improvement_pct  = b_metrics["improvement_pct"],
+            registry_version = b_metrics["registry_version"],
+            pretrain_used    = b_metrics["pretrain_used"],
+        )
+    else:
+        b_name, b_mae = None, None
+
+    # Save metrics report
+    run.save()
 
     print("\n" + "=" * 60)
     print("TRAINING COMPLETE -- summary")

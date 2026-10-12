@@ -1,0 +1,109 @@
+{
+  "schema_version": 1,
+  "started_at": "2026-10-06T16:02:20.147529+00:00",
+  "finished_at": "2026-10-06T16:16:53.245358+00:00",
+  "quick_mode": false,
+  "python": "3.12.0",
+  "platform": "Windows",
+  "track_a": {
+    "dataset": "NHANES",
+    "n_train": 6522,
+    "n_test": 1631,
+    "n_features": 36,
+    "models": {
+      "logistic_regression": {
+        "auc": 0.8166,
+        "f1": 0.5083,
+        "per_target": {
+          "hypertension": {
+            "auc": 0.826,
+            "f1": 0.6882
+          },
+          "nephropathy": {
+            "auc": 0.7791,
+            "f1": 0.387
+          },
+          "cardiovascular": {
+            "auc": 0.8447,
+            "f1": 0.4497
+          }
+        }
+      },
+      "random_forest": {
+        "auc": 0.8179,
+        "f1": 0.4592,
+        "per_target": {
+          "hypertension": {
+            "auc": 0.8223,
+            "f1": 0.6824
+          },
+          "nephropathy": {
+            "auc": 0.791,
+            "f1": 0.3138
+          },
+          "cardiovascular": {
+            "auc": 0.8405,
+            "f1": 0.3812
+          }
+        }
+      },
+      "gradient_boosting": {
+        "auc": 0.8132,
+        "f1": 0.5213,
+        "per_target": {
+          "hypertension": {
+            "auc": 0.8214,
+            "f1": 0.6839
+          },
+          "nephropathy": {
+            "auc": 0.7811,
+            "f1": 0.395
+          },
+          "cardiovascular": {
+            "auc": 0.837,
+            "f1": 0.4851
+          }
+        }
+      }
+    },
+    "winner": "nhanes_random_forest",
+    "winner_auc": 0.8179,
+    "winner_f1": 0.4592,
+    "registry_version": 32
+  },
+  "track_b": {
+    "dataset": "MIMIC-IV Demo",
+    "n_real_patients": 25,
+    "n_real_windows": 661,
+    "n_total_windows": 3305,
+    "gap_filter_hours": 24.0,
+    "window_size": 8,
+    "seeds": 3,
+    "blend_alpha": 0.85,
+    "pretrain_used": true,
+    "models": {
+      "Naive": {
+        "pooled": 54.51,
+        "per_patient": 48.11
+      },
+      "Ridge": {
+        "pooled": 46.26,
+        "per_patient": 40.54
+      },
+      "LSTM v4": {
+        "pooled": 45.8,
+        "per_patient": 40.59
+      },
+      "LSTM v4 + Ridge": {
+        "pooled": 45.45,
+        "per_patient": 40.36
+      }
+    },
+    "winner": "LSTM v4 + Ridge",
+    "winner_pooled_mae": 45.45,
+    "naive_pooled_mae": 54.51,
+    "improvement_mae": 9.06,
+    "improvement_pct": 16.6,
+    "registry_version": 33
+  }
+}
