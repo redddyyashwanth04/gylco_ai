@@ -6,6 +6,7 @@ anchored to the 30 real MIMIC-IV Demo patients.  The synthetic data is
 used for pre-training Track B; the model is then fine-tuned (or evaluated)
 exclusively on real patient windows so evaluation is never contaminated.
 
+
 HOW IT WORKS
 ------------
 1. Fit a profile for each real patient:
