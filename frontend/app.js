@@ -11,12 +11,13 @@ const TARGETS = ["hypertension", "nephropathy", "cardiovascular"];
 const API_BASE = `/api`;
 const DEMO_SESSION_KEY = "carepath_demo_user";
 
-const visits = [];        // saved visits from the local database
-const tempVisits = [];    // visits without a patient ID, browser memory only
+const visits = [];
+const tempVisits = [];
 let pendingVisit = null;
 let forecastState = null;
 let explainResult = null;
 let explainTarget = "hypertension";
+let fuExplainTarget = "hypertension";
 let toastTimer;
 let backendConnected = false;
 let forecastAvailable = false;
@@ -59,10 +60,8 @@ function formatDate(date) {
 }
 
 function metricText(model) {
-  // Track B: match both "mean abs error N" (v3) and "MAE N" (v4)
   const maeMatch = /(?:mean abs error|MAE)\s+([\d.]+)/.exec(model.notes || "");
   if (maeMatch) return `MAE ${maeMatch[1]} mg/dL`;
-  // Track A: AUC stored as a numeric column
   return model.val_auc ? `AUC ${Number(model.val_auc).toFixed(3)}` : "Not recorded";
 }
 
@@ -115,15 +114,12 @@ function updateTrajectoryOptions() {
   const select = byId("trajectory-patient");
   const selected = select.value;
   const patients = [...new Set(visits.map((v) => v.patientId).filter(Boolean))];
-
   select.replaceChildren();
-
   if (patients.length === 0) {
     select.append(new Option("No tracked patients yet — save a visit first", ""));
   } else {
     patients.forEach((id) => select.append(new Option(id, `patient:${id}`)));
   }
-
   if ([...select.options].some((o) => o.value === selected)) select.value = selected;
 }
 
@@ -256,9 +252,8 @@ byId("example-button").addEventListener("click", () => {
     const el = byId(id);
     if (el) el.value = value;
   });
-  // dropdowns
-  byId("sex").value = "1";        // Male
-  byId("smoking").value = "2";    // Former smoker
+  byId("sex").value = "1";
+  byId("smoking").value = "2";
   pendingVisit = null;
   clearModelResult();
   byId("model-empty-title").textContent = "Ready for assessment";
@@ -309,6 +304,8 @@ function setSnapshot(visit) {
 }
 
 function showModelResult(result) {
+  // When the overlay is open these sidebar panels are hidden behind it — skip update
+  if (!byId("followup-overlay").hidden) return;
   byId("model-empty-state").hidden = true;
   byId("model-badge").innerHTML = `<span></span>${escapeHTML(result.modelName)}`;
   byId("model-slots").setAttribute("aria-label", `Risk estimates from ${result.modelName}`);
@@ -336,27 +333,36 @@ function clearModelResult() {
   byId("recommendation-list").hidden = true;
   byId("recommendation-empty").hidden = false;
   byId("explain-panel").hidden = true;
+  byId("prev-note-panel").hidden = true;
   explainResult = null;
 }
 
-/* ---------- explanation (SHAP drivers) ---------- */
+/* ---------- SHAP (sidebar — kept for reference, overlay is primary) ---------- */
 
 async function loadExplanation(values) {
-  byId("explain-panel").hidden = false;
-  byId("explain-tabs").innerHTML = "";
-  byId("explain-bars").innerHTML = "";
-  byId("explain-source").textContent = "";
-  byId("explain-narrative").textContent = "Computing drivers…";
+  const overlayOpen = !byId("followup-overlay").hidden;
+  if (!overlayOpen) {
+    byId("explain-panel").hidden = false;
+    byId("explain-tabs").innerHTML = "";
+    byId("explain-bars").innerHTML = "";
+    byId("explain-source").textContent = "";
+    byId("explain-narrative").textContent = "Computing drivers…";
+  }
   try {
     explainResult = await apiRequest("/explain", { method: "POST", body: JSON.stringify({ values }) });
     renderExplanation();
+    renderFuExplanation();
   } catch (error) {
     explainResult = null;
-    byId("explain-narrative").textContent = `Explanation unavailable: ${error.message}`;
+    if (!overlayOpen) byId("explain-narrative").textContent = `Explanation unavailable: ${error.message}`;
+    byId("fu-explain-narrative").textContent = `Explanation unavailable: ${error.message}`;
+    byId("fu-explain-panel").hidden = false;
   }
 }
 
 function renderExplanation() {
+  // When the overlay is open, the sidebar explain panel is behind it — skip
+  if (!byId("followup-overlay").hidden) return;
   if (!explainResult) return;
   byId("explain-tabs").innerHTML = TARGETS.map((t) =>
     `<button type="button" class="chip${t === explainTarget ? " active" : ""}" data-target="${t}">${t}</button>`).join("");
@@ -382,6 +388,8 @@ byId("explain-tabs").addEventListener("click", (event) => {
   }
 });
 
+/* ---------- assessment form submit ---------- */
+
 byId("assessment-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget;
@@ -399,10 +407,10 @@ byId("assessment-form").addEventListener("submit", async (event) => {
   const values = {
     RIDAGEYR: visit.age, LBXGH: visit.hba1c, LBXGLU: visit.glucose, BMXBMI: visit.bmi,
     BPXOSY1: visit.systolic, BPXODI1: visit.diastolic, LBDLDL: visit.ldl, LBDHDD: visit.hdl,
-    RIAGENDR: visit.sex,           // 1=Male 2=Female (NHANES code)
-    SMQ020: visit.smoking,         // 1=current 2=former 3=never (NHANES SMQ020)
-    PAD680: visit.sedentary,       // sedentary mins/day → hours sent as-is; backend scales if needed
-    INDFMPIR: visit.income,        // income-to-poverty ratio (NHANES INDFMPIR)
+    RIAGENDR: visit.sex,
+    SMQ020: visit.smoking,
+    PAD680: visit.sedentary,
+    INDFMPIR: visit.income,
   };
   const reviewButton = form.querySelector("button[type='submit']");
   clearModelResult();
@@ -420,15 +428,10 @@ byId("assessment-form").addEventListener("submit", async (event) => {
       body: JSON.stringify({ patientId: visit.patientId, values }),
     });
     pendingVisit = { ...visit, values, result };
-    setSnapshot(visit);
-    showModelResult(result);
-    byId("save-visit-button").disabled = false;
-    byId("save-visit-button").textContent = visit.patientId ? "Save visit to patient record" : "Add to temporary history";
-    byId("save-visit-note").textContent = visit.patientId
-      ? "Measurements, risk snapshot, and visit note will be saved in the local SQLite database."
-      : "Enter a patient ID to save to SQLite; without one, this visit stays in browser memory only.";
-    feedback.textContent = `Estimate returned by ${result.modelName}. This is research decision support, not a diagnosis.`;
-    loadExplanation(values); // non-blocking: risks show immediately, drivers follow
+    // Open the full-screen follow-up overlay
+    openFollowUp(visit, result);
+    // Kick off SHAP in background — fires renderFuExplanation() when done
+    loadExplanation(values);
   } catch (error) {
     pendingVisit = null;
     clearModelResult();
@@ -443,6 +446,136 @@ byId("assessment-form").addEventListener("submit", async (event) => {
     reviewButton.innerHTML = 'Review visit <span aria-hidden="true">→</span>';
   }
 });
+
+/* ---------- follow-up overlay ---------- */
+
+function openFollowUp(visit, result) {
+  // Patient header
+  byId("fu-patient-name").textContent = visit.patientId || "Unidentified patient";
+  byId("fu-patient-meta").textContent = `${visit.age} years · Current visit`;
+  byId("fu-model-badge").innerHTML = `<span></span>${escapeHTML(result.modelName)}`;
+
+  // Snapshot tiles
+  const snapshots = [
+    ["HbA1c",          visit.hba1c    === null ? "Not entered" : `${visit.hba1c.toFixed(1)}%`],
+    ["Glucose",        visit.glucose  === null ? "Not entered" : `${visit.glucose} mg/dL`],
+    ["BMI",            visit.bmi      === null ? "Not entered" : `${visit.bmi.toFixed(1)}`],
+    ["Blood pressure", visit.systolic === null || visit.diastolic === null ? "Not entered" : `${visit.systolic}/${visit.diastolic}`],
+  ];
+  byId("fu-snapshot-list").innerHTML = snapshots.map(([label, value]) =>
+    `<div class="snapshot-item"><span>${label}</span><strong>${value}</strong></div>`).join("");
+
+  // Risk scores
+  TARGETS.forEach((target) => {
+    const risk = Number(result.risks[target]);
+    const trend = result.trends?.[target];
+    const trendText = trend ? ` · ${trend.direction} ${Math.abs(trend.delta * 100).toFixed(1)}%` : "";
+    const el = byId(`fu-risk-${target}`);
+    el.textContent = `${(risk * 100).toFixed(0)}%${trendText}`;
+    el.className = "risk-result loaded";
+  });
+
+  // Previous note
+  if (result.previousNote) {
+    const rawDate = result.previousNoteDate ? new Date(result.previousNoteDate) : null;
+    byId("fu-prev-note-date").textContent = rawDate && !Number.isNaN(rawDate.getTime()) ? formatDate(rawDate) : "previous visit";
+    byId("fu-prev-note-text").textContent = result.previousNote;
+    byId("fu-prev-note-panel").hidden = false;
+  } else {
+    byId("fu-prev-note-panel").hidden = true;
+  }
+
+  // Recommendations
+  byId("fu-recommendation-empty").hidden = result.recommendations.length > 0;
+  byId("fu-recommendation-list").innerHTML = result.recommendations.map((r) => `<li>${escapeHTML(r)}</li>`).join("");
+  byId("fu-recommendation-list").hidden = result.recommendations.length === 0;
+
+  // Note and save button
+  byId("fu-visit-note").value = "";
+  byId("fu-feedback").textContent = "";
+  byId("fu-save-button").disabled = !visit.patientId;
+  byId("fu-save-note").textContent = visit.patientId
+    ? "Measurements, risk snapshot, and visit note will be saved in the local SQLite database."
+    : "Enter a patient ID on the form to save to the database.";
+
+  // SHAP — reset; renderFuExplanation() called when explain API returns
+  fuExplainTarget = "hypertension";
+  byId("fu-explain-panel").hidden = true;
+  byId("fu-explain-tabs").innerHTML = "";
+  byId("fu-explain-bars").innerHTML = "";
+  byId("fu-explain-narrative").textContent = "Computing drivers…";
+
+  byId("followup-overlay").hidden = false;
+  byId("followup-overlay").scrollTop = 0;
+  document.body.style.overflow = "hidden";
+}
+
+function closeFollowUp() {
+  byId("followup-overlay").hidden = true;
+  document.body.style.overflow = "";
+}
+
+function renderFuExplanation() {
+  if (!explainResult) return;
+  byId("fu-explain-tabs").innerHTML = TARGETS.map((t) =>
+    `<button type="button" class="chip${t === fuExplainTarget ? " active" : ""}" data-fu-target="${t}">${t}</button>`).join("");
+  const factors = explainResult.factors[fuExplainTarget] || [];
+  const max = Math.max(...factors.map((f) => Math.abs(f.shap)), 1e-9);
+  byId("fu-explain-bars").innerHTML = factors.map((f) => `<div class="bar-row">
+    <span>${escapeHTML(f.label)}${f.entered ? "" : " <em>(typical value assumed)</em>"}</span>
+    <span class="bar-track"><i class="${f.shap > 0 ? "up" : "down"}" style="width:${(Math.abs(f.shap) / max) * 100}%"></i></span>
+    <span class="bar-val">${f.shap > 0 ? "+" : ""}${f.shap.toFixed(2)}</span>
+  </div>`).join("");
+  byId("fu-explain-narrative").textContent = explainResult.narrative[fuExplainTarget] || "";
+  const source = explainResult.narrativeSource[fuExplainTarget];
+  byId("fu-explain-source").textContent = source === "llm"
+    ? "Narrative written by an LLM from the SHAP values above only."
+    : source === "template" ? "Template summary of the SHAP values above." : "";
+  byId("fu-explain-panel").hidden = false;
+}
+
+byId("fu-explain-tabs").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-fu-target]");
+  if (button && explainResult) {
+    fuExplainTarget = button.dataset.fuTarget;
+    renderFuExplanation();
+  }
+});
+
+byId("fu-back-button").addEventListener("click", closeFollowUp);
+
+byId("fu-save-button").addEventListener("click", async () => {
+  if (!pendingVisit) return;
+  const saved = { ...pendingVisit };
+  const note = byId("fu-visit-note").value.trim() || null;
+  if (saved.patientId) {
+    try {
+      await apiRequest("/visits", {
+        method: "POST",
+        body: JSON.stringify({ patientId: saved.patientId, values: saved.values, note }),
+      });
+      await loadVisitsFromBackend();
+      byId("fu-feedback").textContent = `Visit saved for ${saved.patientId}.`;
+      showToast("Visit and risk snapshot saved to the local SQLite database.");
+      byId("fu-save-button").disabled = true;
+    } catch (error) {
+      byId("fu-feedback").textContent = `Visit was not saved: ${error.message}`;
+    }
+  } else {
+    tempVisits.unshift({
+      patientId: "", date: saved.date, hba1c: saved.hba1c, glucose: saved.glucose, bmi: saved.bmi,
+      systolic: saved.systolic, diastolic: saved.diastolic, risks: saved.result.risks,
+    });
+    updateVisitCounts();
+    renderHistory();
+    byId("fu-feedback").textContent = "Visit added to temporary browser history only.";
+    showToast("No patient ID provided; visit stays in browser memory only.");
+    byId("fu-save-button").disabled = true;
+  }
+  pendingVisit = null;
+});
+
+/* ---------- old sidebar save-visit button (kept for legacy form flow) ---------- */
 
 byId("save-visit-button").addEventListener("click", async () => {
   if (!pendingVisit) return;

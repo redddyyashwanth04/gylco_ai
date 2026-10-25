@@ -103,14 +103,10 @@
         </div>
 
         <div class="workflow-strip" aria-label="Assessment steps">
-          <div class="workflow-step active"><span>1</span><div><strong>Patient & measurements</strong><small>Enter current encounter values</small></div></div>
-          <span class="workflow-line"></span>
-          <div class="workflow-step"><span>2</span><div><strong>Clinical review</strong><small>Estimates and drivers</small></div></div>
-          <span class="workflow-line"></span>
-          <div class="workflow-step"><span>3</span><div><strong>Follow-up</strong><small>Clinician-led decision</small></div></div>
+          <div class="workflow-step active"><span>1</span><div><strong>Patient &amp; measurements</strong><small>Enter current encounter values</small></div></div>
         </div>
 
-        <div class="assessment-grid">
+        <div class="assessment-grid assessment-grid--single">
           <form class="panel input-panel" id="assessment-form" novalidate>
             <div class="panel-heading">
               <div><h2>Patient measurements</h2><p>Enter values from the current visit.</p></div>
@@ -181,7 +177,7 @@
             <p class="form-feedback" id="form-feedback" aria-live="polite"></p>
           </form>
 
-          <aside class="review-column">
+          <aside class="review-column" hidden>
             <section class="panel review-panel">
               <div class="review-heading"><div><p class="eyebrow">CLINICAL REVIEW</p><h2>Visit snapshot</h2></div><span class="pending-badge" id="model-badge"><span></span>Awaiting model</span></div>
               <div class="empty-model-state" id="model-empty-state">
@@ -200,7 +196,6 @@
               </div>
               <p class="disclaimer">Decision-support prototype only. Not for diagnosis or treatment decisions.</p>
             </section>
-
             <section class="panel review-panel" id="explain-panel" hidden>
               <div class="review-heading"><div><p class="eyebrow">WHY THIS ESTIMATE</p><h2>Top drivers</h2></div></div>
               <div class="chip-row" id="explain-tabs"></div>
@@ -209,11 +204,15 @@
               <p class="tiny-note" id="explain-source"></p>
               <p class="tiny-note">Bars show each factor's shift in estimated probability (SHAP). Orange raises the estimate, green lowers it. "Typical value assumed" means the field was not entered.</p>
             </section>
-
             <section class="panel follow-up-panel">
               <div class="panel-heading compact"><div><p class="eyebrow">FOR YOUR REVIEW</p><h2>Points for clinician review</h2></div><span class="plan-icon">＋</span></div>
               <p class="muted-copy" id="recommendation-empty">Points for review will appear after a successful assessment.</p>
               <ul class="recommendation-list" id="recommendation-list" hidden></ul>
+              <div class="prev-note-panel" id="prev-note-panel" hidden>
+                <p class="eyebrow" style="margin-bottom:4px">PREVIOUS VISIT NOTE</p>
+                <p class="prev-note-date" id="prev-note-date"></p>
+                <p class="prev-note-text" id="prev-note-text"></p>
+              </div>
               <label class="field note-field"><span>Visit note <em>Saved with visit</em></span><textarea id="visit-note" rows="3" placeholder="Add a clinical note for this visit…"></textarea></label>
               <button class="secondary-button" type="button" id="save-visit-button" disabled>Save visit</button>
               <p class="tiny-note" id="save-visit-note">A patient ID is required to save this encounter to the local patient database.</p>
@@ -270,6 +269,101 @@
       <footer class="app-footer"><span>Carepath prototype</span><span>Research decision-support preview <i>·</i> Not a medical device</span></footer>
     </main>
   </div>
+
+  <!-- FOLLOW-UP OVERLAY — opens when Review visit succeeds -->
+  <div class="followup-overlay" id="followup-overlay" aria-modal="true" role="dialog" aria-labelledby="fu-title" hidden>
+    <div class="followup-inner">
+
+      <!-- Header bar -->
+      <div class="followup-header">
+        <div class="followup-header-left">
+          <button class="fu-back-button" id="fu-back-button" type="button">← Back to form</button>
+          <div class="followup-breadcrumb">
+            <span>Current assessment</span>
+            <span class="slash">/</span>
+            <strong id="fu-title">Clinical review</strong>
+          </div>
+        </div>
+        <span class="pending-badge" id="fu-model-badge"><span></span>Awaiting model</span>
+      </div>
+
+      <!-- Two-column body -->
+      <div class="followup-body">
+
+        <!-- LEFT column: patient snapshot + risk scores + SHAP -->
+        <div class="followup-left">
+
+          <!-- Patient snapshot -->
+          <section class="panel fu-panel">
+            <div class="review-heading">
+              <div><p class="eyebrow">CLINICAL REVIEW</p><h2>Visit snapshot</h2></div>
+            </div>
+            <div class="review-values" id="fu-review-values">
+              <div class="review-patient">
+                <span class="avatar small">PT</span>
+                <div><strong id="fu-patient-name">—</strong><small id="fu-patient-meta">Current visit</small></div>
+              </div>
+              <div class="snapshot-list" id="fu-snapshot-list"></div>
+            </div>
+            <div class="model-slots" id="fu-model-slots" aria-label="Model estimates">
+              <div class="model-slot"><span>Hypertension</span><strong class="risk-result" id="fu-risk-hypertension">—</strong></div>
+              <div class="model-slot"><span>Nephropathy</span><strong class="risk-result" id="fu-risk-nephropathy">—</strong></div>
+              <div class="model-slot"><span>Cardiovascular</span><strong class="risk-result" id="fu-risk-cardiovascular">—</strong></div>
+            </div>
+            <p class="disclaimer">Decision-support prototype only. Not for diagnosis or treatment decisions.</p>
+          </section>
+
+          <!-- SHAP drivers -->
+          <section class="panel fu-panel" id="fu-explain-panel" hidden>
+            <div class="review-heading"><div><p class="eyebrow">WHY THIS ESTIMATE</p><h2>Top drivers</h2></div></div>
+            <div class="chip-row" id="fu-explain-tabs"></div>
+            <div id="fu-explain-bars"></div>
+            <p class="muted-copy" id="fu-explain-narrative"></p>
+            <p class="tiny-note" id="fu-explain-source"></p>
+            <p class="tiny-note">Bars show each factor's shift in estimated probability (SHAP). Orange raises the estimate, green lowers it. "Typical value assumed" means the field was not entered.</p>
+          </section>
+
+        </div>
+
+        <!-- RIGHT column: recommendations + previous note + new note -->
+        <div class="followup-right">
+
+          <section class="panel fu-panel fu-review-panel">
+            <div class="panel-heading compact">
+              <div><p class="eyebrow">FOR YOUR REVIEW</p><h2>Points for clinician review</h2></div>
+              <span class="plan-icon">＋</span>
+            </div>
+            <p class="muted-copy" id="fu-recommendation-empty">Points for review will appear here.</p>
+            <ul class="recommendation-list" id="fu-recommendation-list" hidden></ul>
+          </section>
+
+          <section class="panel fu-panel">
+            <div class="panel-heading compact">
+              <div><p class="eyebrow">VISIT NOTE</p><h2>Clinician notes</h2></div>
+            </div>
+            <!-- Previous note (shown if patient has a prior visit) -->
+            <div class="prev-note-panel" id="fu-prev-note-panel" hidden>
+              <p class="eyebrow" style="margin-bottom:4px">PREVIOUS VISIT NOTE</p>
+              <p class="prev-note-date" id="fu-prev-note-date"></p>
+              <p class="prev-note-text" id="fu-prev-note-text"></p>
+            </div>
+            <!-- New note -->
+            <label class="field note-field" style="margin-top:10px">
+              <span>New note <em>Saved with visit</em></span>
+              <textarea id="fu-visit-note" rows="5" placeholder="Add a clinical note for this visit…"></textarea>
+            </label>
+            <button class="primary-button fu-save-button" type="button" id="fu-save-button" disabled>
+              Save visit to patient record <span aria-hidden="true">→</span>
+            </button>
+            <p class="tiny-note" id="fu-save-note">A patient ID is required to save this encounter.</p>
+            <p class="form-feedback" id="fu-feedback" aria-live="polite"></p>
+          </section>
+
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
 </body>
 </html>

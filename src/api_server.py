@@ -323,16 +323,27 @@ class ApiHandler(BaseHTTPRequestHandler):
         recommendations = generate_clinical_recommendations(values, risks)
 
         # Trend = change versus the risks stored at the patient's previous visit.
+        # Also surface the last visit note so the clinician sees prior context.
         trends = None
+        previous_note = None
+        previous_note_date = None
         patient_id = str(payload.get("patientId", "")).strip()
         if patient_id:
             history = get_patient_history(patient_id)
-            if history and history[-1]["risks_json"]:
-                previous = json.loads(history[-1]["risks_json"])
-                trends = {}
-                for target in TARGETS:
-                    delta, direction = compute_risk_delta({target: risks[target]}, previous)
-                    trends[target] = {"delta": delta, "direction": direction}
+            if history:
+                last = history[-1]
+                if last["risks_json"]:
+                    previous = json.loads(last["risks_json"])
+                    trends = {}
+                    for target in TARGETS:
+                        delta, direction = compute_risk_delta({target: risks[target]}, previous)
+                        trends[target] = {"delta": delta, "direction": direction}
+                # Surface last note regardless of whether risks exist
+                raw_note = last["note"] if isinstance(last, dict) else dict(last).get("note")
+                if raw_note:
+                    previous_note      = raw_note
+                    previous_note_date = (last["visit_date"] if isinstance(last, dict)
+                                          else dict(last).get("visit_date"))
 
         active = get_active_model_version("nhanes_active")
         if active:
@@ -343,6 +354,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             "modelName": model_name,
             "recommendations": recommendations,
             "trends": trends,
+            "previousNote": previous_note,
+            "previousNoteDate": previous_note_date,
         })
 
     def post_explain(self, payload):

@@ -130,7 +130,7 @@ def get_patient_history(patient_id):
     """Every logged visit for one patient, oldest first."""
     conn = get_connection()
     rows = conn.execute(
-        "SELECT visit_date, hba1c, glucose, bmi, systolic_bp, diastolic_bp, risks_json "
+        "SELECT visit_date, hba1c, glucose, bmi, systolic_bp, diastolic_bp, risks_json, note "
         "FROM visits WHERE patient_id = ? ORDER BY visit_date ASC, visit_id ASC",
         (patient_id,),
     ).fetchall()
